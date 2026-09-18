@@ -1,0 +1,26 @@
+# After Vercel reports a successful production deployment, hit /api/health and
+# require the deployed sha to be the one that was pushed. A red run here is what
+# the host's `agent-os dispatch` watches after its own PR merges; it reverts on red.
+name: post-deploy
+on:
+  deployment_status:
+jobs:
+  health:
+    name: health
+    if: github.event.deployment_status.state == 'success' && github.event.deployment_status.environment == 'Production'
+    runs-on: ubuntu-latest
+    steps:
+      - name: check /api/health
+        env:
+          URL: ${{ github.event.deployment_status.environment_url }}
+          SHA: ${{ github.event.deployment.sha }}
+        run: |
+          for i in 1 2 3 4 5 6; do
+            body=$(curl -fsS "$URL/api/health" || true)
+            echo "attempt $i: $body"
+            if echo "$body" | grep -q '"ok":true' && echo "$body" | grep -q "\"sha\":\"$SHA\""; then
+              echo "healthy at $SHA"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::health check failed for $URL at $SHA"; exit 1

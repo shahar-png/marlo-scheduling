@@ -1,0 +1,21 @@
+# The gate. Re-runs PROOF_CMD on every PR; branch protection makes this check
+# required, so auto-merge cannot fire without it.
+name: proof
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [main]
+jobs:
+  proof:
+    name: proof
+    runs-on: ubuntu-latest
+    steps:
+      - name: hold label blocks the gate
+        if: contains(github.event.pull_request.labels.*.name, 'hold')
+        run: echo '::error::PR carries the hold label; auto-merge blocked' && exit 1
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
