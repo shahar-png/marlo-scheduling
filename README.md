@@ -16,6 +16,16 @@ npm run dev
 
 `GET /` serves the Marlo Scheduling placeholder. `GET /api/health` returns `{ "ok": true }`.
 
+## Environment variables
+
+Set these names in the host environment (Vercel / local `.env`). Do not commit secret values.
+
+- `AUTH_SECRET` — Auth.js session secret
+- `AUTH_GOOGLE_ID` — Google OAuth client id (Workspace Internal app for myoli.co)
+- `AUTH_GOOGLE_SECRET` — Google OAuth client secret
+
+The Google OAuth app is Internal to the `myoli.co` Workspace. Sign-in also allowlists that hosted domain (`hd`) in code.
+
 - Work orders: copy `docs/PLAN-TEMPLATE.md` to `PLAN.md`, review with the VP of Product, then `agent-os dispatch PLAN.md`.
 - `PROOF_CMD` for this repo: `npm test`
 - Kill switch: label a PR `hold`.
