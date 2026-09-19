@@ -2,6 +2,7 @@ import {
   CALENDAR_INVITATION,
   EMAIL_CONFIRMATION,
   getEventType,
+  GROUP,
   ONE_ON_ONE,
   resolveNotificationMode,
   type EventType,
@@ -163,11 +164,58 @@ export function listConfirmedBookingsForHost(hostId: string): Booking[] {
     .map(cloneBooking);
 }
 
-export function hostBookingsAsBusy(hostId: string): BusyWindow[] {
-  return listConfirmedBookingsForHost(hostId).map((booking) => ({
-    start: booking.start,
-    end: booking.end,
-  }));
+export function hostBookingsAsBusy(
+  hostId: string,
+  options?: { excludeEventTypeId?: string },
+): BusyWindow[] {
+  return listConfirmedBookingsForHost(hostId)
+    .filter(
+      (booking) => booking.eventTypeId !== options?.excludeEventTypeId,
+    )
+    .map((booking) => ({
+      start: booking.start,
+      end: booking.end,
+    }));
+}
+
+export function countConfirmedBookingsAt(
+  eventTypeId: string,
+  start: string,
+): number {
+  return [...bookings.values()].filter(
+    (booking) =>
+      booking.eventTypeId === eventTypeId &&
+      booking.start === start &&
+      booking.status === BOOKING_CONFIRMED,
+  ).length;
+}
+
+export function spotsRemainingFor(
+  eventType: EventType,
+  start: string,
+): number {
+  if (eventType.kind !== GROUP) {
+    return countConfirmedBookingsAt(eventType.id, start) === 0 ? 1 : 0;
+  }
+  const max = eventType.maxInvitees ?? 0;
+  return Math.max(0, max - countConfirmedBookingsAt(eventType.id, start));
+}
+
+export type GroupAvailableTime = {
+  start: string;
+  spots_remaining: number;
+};
+
+export function withSpotsRemaining(
+  times: string[],
+  eventType: EventType,
+): GroupAvailableTime[] {
+  return times
+    .map((start) => ({
+      start,
+      spots_remaining: spotsRemainingFor(eventType, start),
+    }))
+    .filter((row) => row.spots_remaining > 0);
 }
 
 export function createBooking(input: CreateBookingInput): Booking {
@@ -176,10 +224,18 @@ export function createBooking(input: CreateBookingInput): Booking {
   if (!Number.isFinite(startMs)) {
     throw new BookingValidationError('start must be a valid ISO-8601 instant');
   }
-  if (input.eventType.kind !== ONE_ON_ONE) {
+  if (input.eventType.kind !== ONE_ON_ONE && input.eventType.kind !== GROUP) {
     throw new BookingValidationError(
-      `kind must be "${ONE_ON_ONE}"; ${input.eventType.kind} bookings are rejected`,
+      `kind must be "${ONE_ON_ONE}" or "${GROUP}"; ${input.eventType.kind} bookings are rejected`,
     );
+  }
+  if (input.eventType.kind === GROUP) {
+    if (
+      !Number.isInteger(input.eventType.maxInvitees) ||
+      (input.eventType.maxInvitees ?? 0) <= 0
+    ) {
+      throw new BookingValidationError('maxInvitees must be a positive integer');
+    }
   }
   if (
     !Number.isInteger(input.eventType.durationMinutes) ||
@@ -235,6 +291,13 @@ export async function bookAvailableSlot(
       startMs + input.eventType.durationMinutes * 60_000,
     ).toISOString();
 
+    const extraBusy = hostBookingsAsBusy(
+      input.eventType.hostId,
+      input.eventType.kind === GROUP
+        ? { excludeEventTypeId: input.eventType.id }
+        : undefined,
+    );
+
     const times = await listAvailableTimes({
       eventType: input.eventType,
       schedule,
@@ -243,11 +306,18 @@ export async function bookAvailableSlot(
       timeMax: end,
       provider: input.provider,
       calendarId: input.calendarId,
-      extraBusy: hostBookingsAsBusy(input.eventType.hostId),
+      extraBusy,
     });
 
     if (!times.includes(start)) {
       throw new BookingConflictError();
+    }
+
+    if (input.eventType.kind === GROUP) {
+      const max = input.eventType.maxInvitees ?? 0;
+      if (countConfirmedBookingsAt(input.eventType.id, start) >= max) {
+        throw new BookingConflictError('session_full');
+      }
     }
 
     const mode = resolveNotificationMode(input.eventType.notificationMode);

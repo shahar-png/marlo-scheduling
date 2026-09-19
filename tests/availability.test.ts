@@ -93,8 +93,8 @@ describe('AC-2 one-on-one event-type stub', () => {
     assert.deepEqual(getEventTypeBySlug('intro-30'), created);
   });
 
-  it('rejects group, collective, and round_robin kinds', () => {
-    for (const kind of ['group', 'collective', 'round_robin'] as const) {
+  it('rejects collective and round_robin kinds', () => {
+    for (const kind of ['collective', 'round_robin'] as const) {
       assert.throws(
         () =>
           createEventType({

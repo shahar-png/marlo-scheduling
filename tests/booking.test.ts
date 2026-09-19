@@ -123,15 +123,15 @@ describe('AC-1 booking stub', () => {
     );
   });
 
-  it('rejects a non-one-on-one event type', () => {
+  it('rejects a collective or round_robin event type', () => {
     const eventType = {
-      id: 'et-group',
+      id: 'et-collective',
       hostId: 'host-1',
-      slug: 'group',
-      name: 'Group',
+      slug: 'collective',
+      name: 'Collective',
       durationMinutes: 30,
       availabilityScheduleId: 'sched-1',
-      kind: 'group',
+      kind: 'collective',
     } as unknown as EventType;
 
     assert.throws(
