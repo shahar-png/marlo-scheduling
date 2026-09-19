@@ -6,6 +6,17 @@ const path = require('node:path');
 
 const root = path.join(__dirname, '..');
 
+// Proof/CI has no Google secrets. Dummy names only — never used for live OAuth.
+if (!process.env.AUTH_SECRET) {
+  process.env.AUTH_SECRET = 'proof-only-auth-secret-not-for-production';
+}
+if (!process.env.AUTH_GOOGLE_ID) {
+  process.env.AUTH_GOOGLE_ID = 'proof-only-google-id';
+}
+if (!process.env.AUTH_GOOGLE_SECRET) {
+  process.env.AUTH_GOOGLE_SECRET = 'proof-only-google-secret';
+}
+
 function run(command, args) {
   const result = spawnSync(command, args, {
     stdio: 'inherit',

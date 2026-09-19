@@ -6,11 +6,12 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "test:unit": "tsx --test tests/app.test.tsx",
+    "test:unit": "tsx --test tests/app.test.tsx tests/auth.test.ts tests/host.test.tsx tests/calendar.test.ts tests/readme.test.ts",
     "test": "node scripts/proof.cjs"
   },
   "dependencies": {
     "next": "^16.3.5",
+    "next-auth": "^5.0.0-beta.32",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"
   },
