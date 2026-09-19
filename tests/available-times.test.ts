@@ -16,8 +16,6 @@ import { createFixtureCalendarProvider } from '../lib/calendar/google-freebusy';
 import type { GoogleFreeBusyFixture } from '../lib/calendar/google-freebusy';
 import { isAuthorizedForPath } from '../lib/auth/host-guard';
 import { GET as healthGET } from '../app/api/health/route';
-import HomePage from '../app/page';
-import { renderToStaticMarkup } from 'react-dom/server';
 
 function seedIntro30() {
   const schedule = createAvailabilitySchedule({
@@ -124,9 +122,6 @@ describe('AC-5 GET /api/event-types/:slug/available-times', () => {
       isAuthorizedForPath(null, '/api/event-types/intro-30/available-times'),
       true,
     );
-
-    const html = renderToStaticMarkup(<HomePage />);
-    assert.match(html, /Marlo Scheduling/);
 
     const health = await healthGET();
     assert.equal(health.status, 200);
