@@ -2,10 +2,16 @@ import { getHostCalendarConnection } from '@/lib/calendar/connection';
 import { createFixtureCalendarProvider } from '@/lib/calendar/google-freebusy';
 import type { CalendarProvider } from '@/lib/calendar/provider';
 import type { GoogleFreeBusyFixture } from '@/lib/calendar/google-freebusy';
-import { getEventTypeBySlug } from '@/lib/availability/event-type';
+import { getEventTypeBySlug, GROUP } from '@/lib/availability/event-type';
 import { getAvailabilitySchedule } from '@/lib/availability/schedule';
-import { listAvailableTimes } from '@/lib/availability/slots';
-import { hostBookingsAsBusy } from '@/lib/booking/booking';
+import {
+  listAvailableTimes,
+  listAvailableTimesWithCapacity,
+} from '@/lib/availability/slots';
+import {
+  hostBookingsAsBusy,
+  listConfirmedStartsForEventType,
+} from '@/lib/booking/booking';
 import fixture from '@/tests/fixtures/google-freebusy.json';
 
 let injectedProvider: CalendarProvider | null = null;
@@ -54,6 +60,35 @@ export async function GET(
 
   const connection = getHostCalendarConnection(eventType.hostId);
   const calendarId = connection?.destinationCalendarId ?? 'primary';
+
+  if (eventType.kind === GROUP) {
+    const maxInvitees = eventType.maxInvitees;
+    if (
+      maxInvitees === undefined ||
+      !Number.isInteger(maxInvitees) ||
+      maxInvitees <= 0
+    ) {
+      return Response.json(
+        { error: 'maxInvitees must be a positive integer' },
+        { status: 400 },
+      );
+    }
+
+    const times = await listAvailableTimesWithCapacity({
+      eventType,
+      schedule,
+      timeMin,
+      timeMax,
+      provider: getCalendarProvider(),
+      calendarId,
+      extraBusy: hostBookingsAsBusy(eventType.hostId, {
+        excludeEventTypeId: eventType.id,
+      }),
+      maxInvitees,
+      confirmedStarts: listConfirmedStartsForEventType(eventType.id),
+    });
+    return Response.json({ times });
+  }
 
   const times = await listAvailableTimes({
     eventType,

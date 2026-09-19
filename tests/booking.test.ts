@@ -123,27 +123,30 @@ describe('AC-1 booking stub', () => {
     );
   });
 
-  it('rejects a non-one-on-one event type', () => {
-    const eventType = {
-      id: 'et-group',
-      hostId: 'host-1',
-      slug: 'group',
-      name: 'Group',
-      durationMinutes: 30,
-      availabilityScheduleId: 'sched-1',
-      kind: 'group',
-    } as unknown as EventType;
+  it('rejects collective and round_robin event types', () => {
+    for (const kind of ['collective', 'round_robin'] as const) {
+      const eventType = {
+        id: `et-${kind}`,
+        hostId: 'host-1',
+        slug: kind,
+        name: kind,
+        durationMinutes: 30,
+        availabilityScheduleId: 'sched-1',
+        kind,
+        notificationMode: 'calendar_invitation',
+      } as unknown as EventType;
 
-    assert.throws(
-      () =>
-        createBooking({
-          eventType,
-          start: SLOT_0900,
-          invitee: { name: 'Ada', email: 'ada@example.com' },
-          calendarEventId: 'mock-event-1',
-        }),
-      /rejected/,
-    );
+      assert.throws(
+        () =>
+          createBooking({
+            eventType,
+            start: SLOT_0900,
+            invitee: { name: 'Ada', email: 'ada@example.com' },
+            calendarEventId: 'mock-event-1',
+          }),
+        /rejected/,
+      );
+    }
   });
 });
 

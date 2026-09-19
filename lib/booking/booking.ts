@@ -2,6 +2,7 @@ import {
   CALENDAR_INVITATION,
   EMAIL_CONFIRMATION,
   getEventType,
+  GROUP,
   ONE_ON_ONE,
   resolveNotificationMode,
   type EventType,
@@ -36,6 +37,8 @@ import { cancelReminderJobs } from './reminders';
 
 export const BOOKING_CONFIRMED = 'confirmed' as const;
 export const BOOKING_CANCELLED = 'cancelled' as const;
+export const SLOT_UNAVAILABLE = 'slot_unavailable' as const;
+export const SESSION_FULL = 'session_full' as const;
 
 export type BookingStatus =
   | typeof BOOKING_CONFIRMED
@@ -126,7 +129,7 @@ export class BookingNotFoundError extends Error {
 
 export class BookingConflictError extends Error {
   readonly status = 409;
-  constructor(message = 'slot_unavailable') {
+  constructor(message = SLOT_UNAVAILABLE) {
     super(message);
     this.name = 'BookingConflictError';
   }
@@ -163,11 +166,38 @@ export function listConfirmedBookingsForHost(hostId: string): Booking[] {
     .map(cloneBooking);
 }
 
-export function hostBookingsAsBusy(hostId: string): BusyWindow[] {
-  return listConfirmedBookingsForHost(hostId).map((booking) => ({
-    start: booking.start,
-    end: booking.end,
-  }));
+export function hostBookingsAsBusy(
+  hostId: string,
+  options?: { excludeEventTypeId?: string },
+): BusyWindow[] {
+  return listConfirmedBookingsForHost(hostId)
+    .filter((booking) => booking.eventTypeId !== options?.excludeEventTypeId)
+    .map((booking) => ({
+      start: booking.start,
+      end: booking.end,
+    }));
+}
+
+export function countConfirmedBookingsForSlot(
+  eventTypeId: string,
+  start: string,
+): number {
+  return [...bookings.values()].filter(
+    (booking) =>
+      booking.eventTypeId === eventTypeId &&
+      booking.start === start &&
+      booking.status === BOOKING_CONFIRMED,
+  ).length;
+}
+
+export function listConfirmedStartsForEventType(eventTypeId: string): string[] {
+  return [...bookings.values()]
+    .filter(
+      (booking) =>
+        booking.eventTypeId === eventTypeId &&
+        booking.status === BOOKING_CONFIRMED,
+    )
+    .map((booking) => booking.start);
 }
 
 export function createBooking(input: CreateBookingInput): Booking {
@@ -176,9 +206,9 @@ export function createBooking(input: CreateBookingInput): Booking {
   if (!Number.isFinite(startMs)) {
     throw new BookingValidationError('start must be a valid ISO-8601 instant');
   }
-  if (input.eventType.kind !== ONE_ON_ONE) {
+  if (input.eventType.kind !== ONE_ON_ONE && input.eventType.kind !== GROUP) {
     throw new BookingValidationError(
-      `kind must be "${ONE_ON_ONE}"; ${input.eventType.kind} bookings are rejected`,
+      `kind must be "${ONE_ON_ONE}" or "${GROUP}"; ${input.eventType.kind} bookings are rejected`,
     );
   }
   if (
@@ -235,6 +265,13 @@ export async function bookAvailableSlot(
       startMs + input.eventType.durationMinutes * 60_000,
     ).toISOString();
 
+    const extraBusy = hostBookingsAsBusy(
+      input.eventType.hostId,
+      input.eventType.kind === GROUP
+        ? { excludeEventTypeId: input.eventType.id }
+        : undefined,
+    );
+
     const times = await listAvailableTimes({
       eventType: input.eventType,
       schedule,
@@ -243,11 +280,25 @@ export async function bookAvailableSlot(
       timeMax: end,
       provider: input.provider,
       calendarId: input.calendarId,
-      extraBusy: hostBookingsAsBusy(input.eventType.hostId),
+      extraBusy,
     });
 
     if (!times.includes(start)) {
-      throw new BookingConflictError();
+      throw new BookingConflictError(SLOT_UNAVAILABLE);
+    }
+
+    if (input.eventType.kind === GROUP) {
+      const maxInvitees = input.eventType.maxInvitees;
+      if (
+        maxInvitees === undefined ||
+        !Number.isInteger(maxInvitees) ||
+        maxInvitees <= 0
+      ) {
+        throw new BookingValidationError('maxInvitees must be a positive integer');
+      }
+      if (countConfirmedBookingsForSlot(input.eventType.id, start) >= maxInvitees) {
+        throw new BookingConflictError(SESSION_FULL);
+      }
     }
 
     const mode = resolveNotificationMode(input.eventType.notificationMode);

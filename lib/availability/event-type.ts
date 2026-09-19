@@ -1,13 +1,13 @@
 export const ONE_ON_ONE = 'one_on_one' as const;
+export const GROUP = 'group' as const;
 export const CALENDAR_INVITATION = 'calendar_invitation' as const;
 export const EMAIL_CONFIRMATION = 'email_confirmation' as const;
 export const REJECTED_EVENT_TYPE_KINDS = [
-  'group',
   'collective',
   'round_robin',
 ] as const;
 
-export type EventTypeKind = typeof ONE_ON_ONE;
+export type EventTypeKind = typeof ONE_ON_ONE | typeof GROUP;
 export type NotificationMode =
   | typeof CALENDAR_INVITATION
   | typeof EMAIL_CONFIRMATION;
@@ -21,6 +21,7 @@ export type EventType = {
   availabilityScheduleId: string;
   kind: EventTypeKind;
   notificationMode: NotificationMode;
+  maxInvitees?: number;
 };
 
 export type CreateEventTypeInput = {
@@ -31,6 +32,7 @@ export type CreateEventTypeInput = {
   availabilityScheduleId: string;
   kind: string;
   notificationMode?: string;
+  maxInvitees?: number;
 };
 
 const eventTypes = new Map<string, EventType>();
@@ -65,9 +67,17 @@ export function createEventType(input: CreateEventTypeInput): EventType {
   ) {
     throw new Error('durationMinutes must be a positive integer');
   }
-  if (input.kind !== ONE_ON_ONE) {
+  if (input.kind === GROUP) {
+    if (
+      input.maxInvitees === undefined ||
+      !Number.isInteger(input.maxInvitees) ||
+      input.maxInvitees <= 0
+    ) {
+      throw new Error('maxInvitees must be a positive integer');
+    }
+  } else if (input.kind !== ONE_ON_ONE) {
     throw new Error(
-      `kind must be "${ONE_ON_ONE}"; ${input.kind} event types are rejected`,
+      `kind must be "${ONE_ON_ONE}" or "${GROUP}"; ${input.kind} event types are rejected`,
     );
   }
   if (slugs.has(slug)) {
@@ -83,9 +93,12 @@ export function createEventType(input: CreateEventTypeInput): EventType {
     name,
     durationMinutes: input.durationMinutes,
     availabilityScheduleId,
-    kind: ONE_ON_ONE,
+    kind: input.kind === GROUP ? GROUP : ONE_ON_ONE,
     notificationMode,
   };
+  if (input.kind === GROUP) {
+    eventType.maxInvitees = input.maxInvitees;
+  }
   eventTypes.set(eventType.id, eventType);
   slugs.set(slug, eventType.id);
   return { ...eventType };

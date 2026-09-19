@@ -22,6 +22,16 @@ export type ListAvailableTimesInput = {
   extraBusy?: BusyWindow[];
 };
 
+export type AvailableTimeWithCapacity = {
+  start: string;
+  spots_remaining: number;
+};
+
+export type ListAvailableTimesWithCapacityInput = ListAvailableTimesInput & {
+  maxInvitees: number;
+  confirmedStarts?: Iterable<string>;
+};
+
 export async function listAvailableTimes(
   input: ListAvailableTimesInput,
 ): Promise<string[]> {
@@ -70,6 +80,27 @@ export async function listAvailableTimes(
   }
 
   return times;
+}
+
+export async function listAvailableTimesWithCapacity(
+  input: ListAvailableTimesWithCapacityInput,
+): Promise<AvailableTimeWithCapacity[]> {
+  if (!Number.isInteger(input.maxInvitees) || input.maxInvitees <= 0) {
+    throw new Error('maxInvitees must be a positive integer');
+  }
+
+  const times = await listAvailableTimes(input);
+  const counts = new Map<string, number>();
+  for (const start of input.confirmedStarts ?? []) {
+    counts.set(start, (counts.get(start) ?? 0) + 1);
+  }
+
+  return times
+    .map((start) => ({
+      start,
+      spots_remaining: input.maxInvitees - (counts.get(start) ?? 0),
+    }))
+    .filter((row) => row.spots_remaining > 0);
 }
 
 function expandWeeklyWindows(
