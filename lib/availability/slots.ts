@@ -1,4 +1,5 @@
 import type { EventType } from './event-type';
+import type { OneOffMeeting } from './one-off';
 import type { AvailabilitySchedule } from './schedule';
 import type { BusyWindow, CalendarProvider } from '../calendar/provider';
 import {
@@ -11,8 +12,9 @@ import {
 } from './timezone';
 
 export type ListAvailableTimesInput = {
-  eventType: EventType;
-  schedule: AvailabilitySchedule;
+  eventType: Pick<EventType, 'durationMinutes'>;
+  schedule?: AvailabilitySchedule;
+  oneOffMeeting?: OneOffMeeting;
   timeMin: string;
   timeMax: string;
   provider: CalendarProvider;
@@ -28,6 +30,9 @@ export async function listAvailableTimes(
   if (!Number.isFinite(timeMin) || !Number.isFinite(timeMax) || timeMin >= timeMax) {
     throw new Error('timeMin and timeMax must be a valid ISO range');
   }
+  if (!input.oneOffMeeting && !input.schedule) {
+    throw new Error('schedule or oneOffMeeting is required');
+  }
 
   const calendarBusy = await input.provider.freeBusy({
     calendarId: input.calendarId,
@@ -39,11 +44,15 @@ export async function listAvailableTimes(
   const durationMs = input.eventType.durationMinutes * 60_000;
   const times: string[] = [];
 
-  for (const window of expandWeeklyWindows(
-    input.schedule,
-    new Date(timeMin),
-    new Date(timeMax),
-  )) {
+  const windows = input.oneOffMeeting
+    ? expandOneOffWindows(input.oneOffMeeting)
+    : expandWeeklyWindows(
+        input.schedule!,
+        new Date(timeMin),
+        new Date(timeMax),
+      );
+
+  for (const window of windows) {
     for (
       let start = window.startMs;
       start + durationMs <= window.endMs;
@@ -99,6 +108,31 @@ function expandWeeklyWindows(
   }
 
   return windows;
+}
+
+function expandOneOffWindows(
+  meeting: OneOffMeeting,
+): { startMs: number; endMs: number }[] {
+  return meeting.windows.map((window) => {
+    const [year, month, day] = window.date.split('-').map(Number);
+    const start = parseHourMinute(window.start);
+    const end = parseHourMinute(window.end);
+    const date = { year, month, day };
+    return {
+      startMs: zonedLocalToUtc(
+        date,
+        start.hour,
+        start.minute,
+        meeting.timezone,
+      ).getTime(),
+      endMs: zonedLocalToUtc(
+        date,
+        end.hour,
+        end.minute,
+        meeting.timezone,
+      ).getTime(),
+    };
+  });
 }
 
 function overlapsBusy(

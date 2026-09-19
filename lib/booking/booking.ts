@@ -1,4 +1,5 @@
 import {
+  CALENDAR_INVITATION,
   EMAIL_CONFIRMATION,
   getEventType,
   ONE_ON_ONE,
@@ -6,7 +7,16 @@ import {
   type EventType,
   type NotificationMode,
 } from '../availability/event-type';
-import { getAvailabilitySchedule } from '../availability/schedule';
+import { getOneOffMeeting, type OneOffMeeting } from '../availability/one-off';
+import {
+  getAvailabilitySchedule,
+  type AvailabilitySchedule,
+} from '../availability/schedule';
+import {
+  consumeSingleUseLink,
+  getSingleUseLinkByToken,
+  LINK_CONSUMED,
+} from '../availability/single-use-link';
 import { listAvailableTimes } from '../availability/slots';
 import type {
   BusyWindow,
@@ -56,6 +66,24 @@ export type BookAvailableSlotInput = {
   provider: CalendarProvider;
   calendarId: string;
   emailProvider?: EmailProvider;
+  oneOffMeeting?: OneOffMeeting;
+};
+
+export type BookSingleUseLinkInput = {
+  token: string;
+  start: string;
+  invitee: BookingInvitee;
+  provider: CalendarProvider;
+  calendarId: string;
+  emailProvider?: EmailProvider;
+};
+
+export type ListSingleUseAvailableTimesInput = {
+  token: string;
+  timeMin: string;
+  timeMax: string;
+  provider: CalendarProvider;
+  calendarId: string;
 };
 
 export type RescheduleBookingInput = {
@@ -98,8 +126,17 @@ export class BookingConflictError extends Error {
   }
 }
 
+export class SingleUseLinkConsumedError extends Error {
+  readonly status = 410;
+  constructor(message = 'link_consumed') {
+    super(message);
+    this.name = 'SingleUseLinkConsumedError';
+  }
+}
+
 const bookings = new Map<string, Booking>();
 const slotLocks = new Map<string, Promise<void>>();
+const tokenLocks = new Map<string, Promise<void>>();
 
 export function resetBookings(): void {
   bookings.clear();
@@ -180,10 +217,10 @@ export async function bookAvailableSlot(
   const lockKey = `${input.eventType.hostId}:${start}`;
 
   return withSlotLock(lockKey, async () => {
-    const schedule = getAvailabilitySchedule(
-      input.eventType.availabilityScheduleId,
-    );
-    if (!schedule) {
+    const schedule = input.oneOffMeeting
+      ? undefined
+      : getAvailabilitySchedule(input.eventType.availabilityScheduleId);
+    if (!input.oneOffMeeting && !schedule) {
       throw new BookingNotFoundError('availability schedule not found');
     }
 
@@ -194,6 +231,7 @@ export async function bookAvailableSlot(
     const times = await listAvailableTimes({
       eventType: input.eventType,
       schedule,
+      oneOffMeeting: input.oneOffMeeting,
       timeMin: start,
       timeMax: end,
       provider: input.provider,
@@ -226,6 +264,41 @@ export async function bookAvailableSlot(
       mode,
       emailProvider: input.emailProvider ?? getBookingEmailProvider(),
     });
+    return booking;
+  });
+}
+
+export async function listSingleUseAvailableTimes(
+  input: ListSingleUseAvailableTimesInput,
+): Promise<string[]> {
+  const resolved = resolveSingleUseTarget(input.token);
+  return listAvailableTimes({
+    eventType: resolved.eventType,
+    schedule: resolved.schedule,
+    oneOffMeeting: resolved.oneOffMeeting,
+    timeMin: input.timeMin,
+    timeMax: input.timeMax,
+    provider: input.provider,
+    calendarId: input.calendarId,
+    extraBusy: hostBookingsAsBusy(resolved.eventType.hostId),
+  });
+}
+
+export async function bookSingleUseLink(
+  input: BookSingleUseLinkInput,
+): Promise<Booking> {
+  return withLock(tokenLocks, input.token, async () => {
+    const resolved = resolveSingleUseTarget(input.token);
+    const booking = await bookAvailableSlot({
+      eventType: resolved.eventType,
+      start: input.start,
+      invitee: input.invitee,
+      provider: input.provider,
+      calendarId: input.calendarId,
+      emailProvider: input.emailProvider,
+      oneOffMeeting: resolved.oneOffMeeting,
+    });
+    consumeSingleUseLink(input.token, booking.id);
     return booking;
   });
 }
@@ -351,6 +424,58 @@ export async function cancelBooking(
   return cancelled;
 }
 
+function resolveSingleUseTarget(token: string): {
+  eventType: EventType;
+  schedule?: AvailabilitySchedule;
+  oneOffMeeting?: OneOffMeeting;
+} {
+  const link = getSingleUseLinkByToken(token);
+  if (!link) {
+    throw new BookingNotFoundError('single-use link not found');
+  }
+  if (link.status === LINK_CONSUMED) {
+    throw new SingleUseLinkConsumedError();
+  }
+
+  if (link.eventTypeId) {
+    const eventType = getEventType(link.eventTypeId);
+    if (!eventType) {
+      throw new BookingNotFoundError('event type not found');
+    }
+    const schedule = getAvailabilitySchedule(eventType.availabilityScheduleId);
+    if (!schedule) {
+      throw new BookingNotFoundError('availability schedule not found');
+    }
+    return { eventType, schedule };
+  }
+
+  if (link.oneOffMeetingId) {
+    const oneOffMeeting = getOneOffMeeting(link.oneOffMeetingId);
+    if (!oneOffMeeting) {
+      throw new BookingNotFoundError('one-off meeting not found');
+    }
+    return {
+      eventType: eventTypeFromOneOff(oneOffMeeting),
+      oneOffMeeting,
+    };
+  }
+
+  throw new BookingValidationError('single-use link has no target');
+}
+
+function eventTypeFromOneOff(meeting: OneOffMeeting): EventType {
+  return {
+    id: meeting.id,
+    hostId: meeting.hostId,
+    slug: `one-off-${meeting.id}`,
+    name: meeting.name,
+    durationMinutes: meeting.durationMinutes,
+    availabilityScheduleId: meeting.id,
+    kind: ONE_ON_ONE,
+    notificationMode: CALENDAR_INVITATION,
+  };
+}
+
 function inviteeAttendees(
   mode: NotificationMode,
   invitee: BookingInvitee,
@@ -393,12 +518,20 @@ async function withSlotLock<T>(
   key: string,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const previous = slotLocks.get(key) ?? Promise.resolve();
+  return withLock(slotLocks, key, fn);
+}
+
+async function withLock<T>(
+  locks: Map<string, Promise<void>>,
+  key: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const previous = locks.get(key) ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((resolve) => {
     release = resolve;
   });
-  slotLocks.set(
+  locks.set(
     key,
     previous.catch(() => undefined).then(() => current),
   );
@@ -407,8 +540,8 @@ async function withSlotLock<T>(
     return await fn();
   } finally {
     release();
-    if (slotLocks.get(key) === current) {
-      slotLocks.delete(key);
+    if (locks.get(key) === current) {
+      locks.delete(key);
     }
   }
 }
