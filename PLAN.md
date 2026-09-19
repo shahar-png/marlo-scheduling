@@ -1,6 +1,6 @@
 # PLAN — Scaffold Next.js app + green PROOF_CMD
 
-Spec owner: Shahar + VP of Product · Product review: Shahar + Grok · Status: DRAFT
+Spec owner: Shahar + VP of Product · Product review: Shahar + Grok · Status: APPROVED (Founder go + VP Product, 19 Sep 2026 ET)
 
 ## Goal
 
