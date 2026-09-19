@@ -1,6 +1,6 @@
 import type { EventType } from './event-type';
 import type { AvailabilitySchedule } from './schedule';
-import type { CalendarProvider } from '../calendar/provider';
+import type { BusyWindow, CalendarProvider } from '../calendar/provider';
 import {
   addCalendarDays,
   calendarDateOfInstant,
@@ -17,6 +17,7 @@ export type ListAvailableTimesInput = {
   timeMax: string;
   provider: CalendarProvider;
   calendarId: string;
+  extraBusy?: BusyWindow[];
 };
 
 export async function listAvailableTimes(
@@ -28,11 +29,12 @@ export async function listAvailableTimes(
     throw new Error('timeMin and timeMax must be a valid ISO range');
   }
 
-  const busy = await input.provider.freeBusy({
+  const calendarBusy = await input.provider.freeBusy({
     calendarId: input.calendarId,
     timeMin: input.timeMin,
     timeMax: input.timeMax,
   });
+  const busy = [...calendarBusy, ...(input.extraBusy ?? [])];
 
   const durationMs = input.eventType.durationMinutes * 60_000;
   const times: string[] = [];

@@ -5,6 +5,7 @@ import type { GoogleFreeBusyFixture } from '@/lib/calendar/google-freebusy';
 import { getEventTypeBySlug } from '@/lib/availability/event-type';
 import { getAvailabilitySchedule } from '@/lib/availability/schedule';
 import { listAvailableTimes } from '@/lib/availability/slots';
+import { hostBookingsAsBusy } from '@/lib/booking/booking';
 import fixture from '@/tests/fixtures/google-freebusy.json';
 
 let injectedProvider: CalendarProvider | null = null;
@@ -61,6 +62,7 @@ export async function GET(
     timeMax,
     provider: getCalendarProvider(),
     calendarId,
+    extraBusy: hostBookingsAsBusy(eventType.hostId),
   });
 
   return Response.json({ times });

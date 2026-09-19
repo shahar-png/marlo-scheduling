@@ -1,16 +1,17 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { beforeEach, describe, it } from 'node:test';
 import {
   GET,
   setAvailableTimesCalendarProvider,
 } from '../app/api/event-types/[slug]/available-times/route';
-import { createEventType, resetEventTypes } from '../lib/availability/event-type';
+import { createEventType, getEventTypeBySlug, resetEventTypes } from '../lib/availability/event-type';
 import {
   createAvailabilitySchedule,
   resetAvailabilitySchedules,
 } from '../lib/availability/schedule';
+import { bookAvailableSlot, resetBookings } from '../lib/booking/booking';
 import { resetCalendarConnections } from '../lib/calendar/connection';
 import { createFixtureCalendarProvider } from '../lib/calendar/google-freebusy';
 import type { GoogleFreeBusyFixture } from '../lib/calendar/google-freebusy';
@@ -37,6 +38,7 @@ describe('AC-5 GET /api/event-types/:slug/available-times', () => {
   beforeEach(() => {
     resetAvailabilitySchedules();
     resetEventTypes();
+    resetBookings();
     resetCalendarConnections();
     setAvailableTimesCalendarProvider(null);
   });
@@ -85,7 +87,7 @@ describe('AC-5 GET /api/event-types/:slug/available-times', () => {
     assert.equal(badRange.status, 400);
   });
 
-  it('does not export a booking POST and has no booking route', async () => {
+  it('does not export POST on the available-times GET handler', async () => {
     const routePath = path.join(
       process.cwd(),
       'app/api/event-types/[slug]/available-times/route.ts',
@@ -98,21 +100,40 @@ describe('AC-5 GET /api/event-types/:slug/available-times', () => {
       '../app/api/event-types/[slug]/available-times/route'
     );
     assert.equal('POST' in routeModule, false);
+  });
 
-    const bookingRoots = [
-      'app/api/bookings',
-      'app/api/booking',
-      'app/api/event-types/[slug]/book',
-      'app/api/event-types/[slug]/bookings',
-    ];
-    for (const rel of bookingRoots) {
-      assert.equal(existsSync(path.join(process.cwd(), rel)), false);
-    }
+  it('omits a start after a confirmed booking on that slot', async () => {
+    seedIntro30();
+    const fixture = JSON.parse(
+      readFileSync(
+        path.join(process.cwd(), 'tests/fixtures/google-freebusy.json'),
+        'utf8',
+      ),
+    ) as GoogleFreeBusyFixture;
+    const provider = createFixtureCalendarProvider(fixture);
+    setAvailableTimesCalendarProvider(provider);
 
-    const apiDir = path.join(process.cwd(), 'app/api');
-    const names = readdirSync(apiDir);
-    assert.ok(!names.includes('bookings'));
-    assert.ok(!names.includes('booking'));
+    const eventType = getEventTypeBySlug('intro-30');
+    assert.ok(eventType);
+
+    await bookAvailableSlot({
+      eventType,
+      start: '2026-09-20T09:00:00.000Z',
+      invitee: { name: 'Ada', email: 'ada@example.com' },
+      provider,
+      calendarId: 'primary',
+    });
+
+    const response = await GET(
+      new Request(
+        'http://localhost/api/event-types/intro-30/available-times?timeMin=2026-09-20T00:00:00.000Z&timeMax=2026-09-21T00:00:00.000Z',
+      ),
+      { params: Promise.resolve({ slug: 'intro-30' }) },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as { times: string[] };
+    assert.ok(!body.times.includes('2026-09-20T09:00:00.000Z'));
+    assert.ok(body.times.includes('2026-09-20T09:30:00.000Z'));
   });
 
   it('keeps GET / and GET /api/health public', async () => {

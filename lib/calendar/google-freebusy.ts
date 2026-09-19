@@ -1,4 +1,16 @@
-import type { BusyWindow, CalendarProvider, FreeBusyQuery } from './provider';
+import type {
+  BusyWindow,
+  CalendarEventInput,
+  CalendarProvider,
+  CreatedCalendarEvent,
+  FreeBusyQuery,
+} from './provider';
+
+export type RecordedCalendarEvent = CalendarEventInput & { id: string };
+
+export type FixtureCalendarProvider = CalendarProvider & {
+  createdEvents: RecordedCalendarEvent[];
+};
 
 export type GoogleBusyInterval = {
   start: string;
@@ -28,10 +40,21 @@ export function mapGoogleFreeBusyFixture(
 
 export function createFixtureCalendarProvider(
   fixture: GoogleFreeBusyFixture,
-): CalendarProvider {
+): FixtureCalendarProvider {
+  const createdEvents: RecordedCalendarEvent[] = [];
   return {
+    createdEvents,
     async freeBusy(query: FreeBusyQuery): Promise<BusyWindow[]> {
       return mapGoogleFreeBusyFixture(fixture, query.calendarId);
+    },
+    async createEvent(event: CalendarEventInput): Promise<CreatedCalendarEvent> {
+      const created: RecordedCalendarEvent = {
+        ...event,
+        attendees: event.attendees?.map((attendee) => ({ ...attendee })),
+        id: `mock-event-${createdEvents.length + 1}`,
+      };
+      createdEvents.push(created);
+      return { id: created.id };
     },
   };
 }
