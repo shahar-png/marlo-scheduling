@@ -5,26 +5,13 @@ import {
   BookingNotFoundError,
   BookingValidationError,
 } from '@/lib/booking/booking';
+import {
+  getBookingCalendarProvider,
+  setBookingCalendarProvider,
+} from '@/lib/booking/calendar-runtime';
 import { getHostCalendarConnection } from '@/lib/calendar/connection';
-import { createFixtureCalendarProvider } from '@/lib/calendar/google-freebusy';
-import type { CalendarProvider } from '@/lib/calendar/provider';
-import type { GoogleFreeBusyFixture } from '@/lib/calendar/google-freebusy';
-import fixture from '@/tests/fixtures/google-freebusy.json';
 
-let injectedProvider: CalendarProvider | null = null;
-
-export function setBookingCalendarProvider(
-  provider: CalendarProvider | null,
-): void {
-  injectedProvider = provider;
-}
-
-function getCalendarProvider(): CalendarProvider {
-  return (
-    injectedProvider ??
-    createFixtureCalendarProvider(fixture as GoogleFreeBusyFixture)
-  );
-}
+export { setBookingCalendarProvider };
 
 type BookingBody = {
   start?: unknown;
@@ -72,7 +59,7 @@ export async function POST(
       eventType,
       start,
       invitee: { name, email },
-      provider: getCalendarProvider(),
+      provider: getBookingCalendarProvider(),
       calendarId,
     });
     return Response.json({ booking }, { status: 201 });

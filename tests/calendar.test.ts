@@ -78,5 +78,18 @@ describe('AC-4 CalendarProvider freeBusy adapter', () => {
     assert.match(created.id, /^mock-event-/);
     assert.equal(provider.createdEvents.length, 1);
     assert.equal(provider.createdEvents[0]?.id, created.id);
+
+    const patched = await provider.updateEvent({
+      calendarId: 'primary',
+      eventId: created.id,
+      start: '2026-09-20T09:30:00.000Z',
+      end: '2026-09-20T10:00:00.000Z',
+    });
+    assert.equal(patched.id, created.id);
+    assert.equal(provider.patchedEvents.length, 1);
+    assert.equal(provider.patchedEvents[0]?.start, '2026-09-20T09:30:00.000Z');
+
+    await provider.deleteEvent({ calendarId: 'primary', eventId: created.id });
+    assert.deepEqual(provider.deletedEventIds, [created.id]);
   });
 });

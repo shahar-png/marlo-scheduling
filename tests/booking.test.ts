@@ -62,6 +62,8 @@ function delayedFixtureProvider(delayMs = 25): CalendarProvider {
       return inner.freeBusy(query);
     },
     createEvent: (event) => inner.createEvent(event),
+    updateEvent: (event) => inner.updateEvent(event),
+    deleteEvent: (event) => inner.deleteEvent(event),
   } as CalendarProvider & { createdEvents: typeof inner.createdEvents };
 }
 
