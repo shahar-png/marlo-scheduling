@@ -20,11 +20,11 @@ Spec owner: Shahar + VP of Product · Product review: Shahar + Grok · Status: A
 
 | ID | Criterion | How it is observed |
 |---|---|---|
-| AC-1 | Root `package.json` exists with Node scripts; `npm test` exits 0 on a clean checkout after `npm ci` | CI `proof` job and local `npm ci && npm test` |
-| AC-2 | App is Next.js App Router + TypeScript; `npm run build` succeeds (add script; may be invoked from test harness or documented as part of proof if folded into `npm test`) | `npm test` green implies typecheck/build or dedicated scripts that `npm test` runs |
-| AC-3 | Authenticated-unneeded public route `GET /` returns HTTP 200 with Marlo Scheduling placeholder copy (not a Vercel 404) | curl or Playwright against `next start` / preview URL |
-| AC-4 | `GET /api/health` returns HTTP 200 JSON `{ "ok": true }` | curl / unit or integration test |
-| AC-5 | README documents how to run locally (`npm ci`, `npm test`, `npm run dev`) without referencing secrets | file review |
+| AC-1 | Root `package.json` exists with Node scripts; `npm test` exits 0 on a clean checkout after `npm ci` | Solely `PROOF_CMD` (`npm test`) after `npm ci` (CI `proof` job) |
+| AC-2 | App is Next.js App Router + TypeScript; `npm test` runs typecheck and/or `next build` (fold those steps into the `test` script) | Solely `PROOF_CMD` (`npm test`) — no separate manual build step |
+| AC-3 | Automated test asserts the home page renders Marlo Scheduling placeholder copy (React/Next unit or render test; no live server required) | Solely `PROOF_CMD` (`npm test`) |
+| AC-4 | Automated test asserts the `/api/health` handler returns `{ "ok": true }` | Solely `PROOF_CMD` (`npm test`) |
+| AC-5 | README documents `npm ci`, `npm test`, and `npm run dev` (and does not reference secrets); a test reads README and asserts those commands are documented | Solely `PROOF_CMD` (`npm test`) |
 
 ## Builder
 
@@ -51,7 +51,7 @@ BUILDER: claude — greenfield Next scaffold + test harness fits Claude implemen
 PROOF_CMD: npm test
 ```
 
-Expected result: exit code 0; at least one passing test covering health and/or smoke of the app module. Manual: after merge+deploy (when Git linked), `/` and `/api/health` 200 on the Vercel URL.
+`PROOF_CMD` remains exactly `npm test`. Green (exit code 0) means AC-1 through AC-5 are all covered by that command — no manual, curl-only, or preview-URL observation for this slice.
 
 ## Round budget
 
