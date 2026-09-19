@@ -1,7 +1,21 @@
-import { getEventType, ONE_ON_ONE, type EventType } from '../availability/event-type';
+import {
+  EMAIL_CONFIRMATION,
+  getEventType,
+  ONE_ON_ONE,
+  resolveNotificationMode,
+  type EventType,
+  type NotificationMode,
+} from '../availability/event-type';
 import { getAvailabilitySchedule } from '../availability/schedule';
 import { listAvailableTimes } from '../availability/slots';
-import type { BusyWindow, CalendarProvider } from '../calendar/provider';
+import type {
+  BusyWindow,
+  CalendarAttendee,
+  CalendarProvider,
+} from '../calendar/provider';
+import { dispatchBookingNotification } from '../notify/dispatch';
+import type { EmailProvider } from '../notify/email';
+import { getBookingEmailProvider } from '../notify/email-runtime';
 import { cancelReminderJobs } from './reminders';
 
 export const BOOKING_CONFIRMED = 'confirmed' as const;
@@ -41,6 +55,7 @@ export type BookAvailableSlotInput = {
   invitee: BookingInvitee;
   provider: CalendarProvider;
   calendarId: string;
+  emailProvider?: EmailProvider;
 };
 
 export type RescheduleBookingInput = {
@@ -48,6 +63,7 @@ export type RescheduleBookingInput = {
   start: string;
   provider: CalendarProvider;
   calendarId: string;
+  emailProvider?: EmailProvider;
 };
 
 export type CancelBookingInput = {
@@ -55,6 +71,7 @@ export type CancelBookingInput = {
   reason: string;
   provider: CalendarProvider;
   calendarId: string;
+  emailProvider?: EmailProvider;
 };
 
 export class BookingValidationError extends Error {
@@ -188,20 +205,28 @@ export async function bookAvailableSlot(
       throw new BookingConflictError();
     }
 
+    const mode = resolveNotificationMode(input.eventType.notificationMode);
     const created = await input.provider.createEvent({
       calendarId: input.calendarId,
       start,
       end,
       summary: input.eventType.name,
-      attendees: [{ email: invitee.email, displayName: invitee.name }],
+      ...inviteeAttendees(mode, invitee),
     });
 
-    return createBooking({
+    const booking = createBooking({
       eventType: input.eventType,
       start,
       invitee,
       calendarEventId: created.id,
     });
+    await dispatchBookingNotification({
+      booking,
+      action: 'create',
+      mode,
+      emailProvider: input.emailProvider ?? getBookingEmailProvider(),
+    });
+    return booking;
   });
 }
 
@@ -266,21 +291,27 @@ export async function rescheduleBooking(
       throw new BookingConflictError();
     }
 
+    const mode = resolveNotificationMode(eventType.notificationMode);
     await input.provider.updateEvent({
       calendarId: input.calendarId,
       eventId: current.calendarEventId,
       start,
       end,
       summary: eventType.name,
-      attendees: [
-        { email: current.invitee.email, displayName: current.invitee.name },
-      ],
+      ...inviteeAttendees(mode, current.invitee),
     });
 
     current.start = start;
     current.end = end;
     cancelReminderJobs(current.id);
-    return cloneBooking(current);
+    const updated = cloneBooking(current);
+    await dispatchBookingNotification({
+      booking: updated,
+      action: 'reschedule',
+      mode,
+      emailProvider: input.emailProvider ?? getBookingEmailProvider(),
+    });
+    return updated;
   });
 }
 
@@ -308,7 +339,28 @@ export async function cancelBooking(
   booking.status = BOOKING_CANCELLED;
   booking.cancelReason = reason;
   cancelReminderJobs(booking.id);
-  return cloneBooking(booking);
+  const cancelled = cloneBooking(booking);
+  const eventType = getEventType(booking.eventTypeId);
+  const mode = resolveNotificationMode(eventType?.notificationMode);
+  await dispatchBookingNotification({
+    booking: cancelled,
+    action: 'cancel',
+    mode,
+    emailProvider: input.emailProvider ?? getBookingEmailProvider(),
+  });
+  return cancelled;
+}
+
+function inviteeAttendees(
+  mode: NotificationMode,
+  invitee: BookingInvitee,
+): { attendees?: CalendarAttendee[] } {
+  if (mode === EMAIL_CONFIRMATION) {
+    return {};
+  }
+  return {
+    attendees: [{ email: invitee.email, displayName: invitee.name }],
+  };
 }
 
 function normalizeInvitee(invitee: BookingInvitee): BookingInvitee {

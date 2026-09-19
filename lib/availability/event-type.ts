@@ -1,4 +1,6 @@
 export const ONE_ON_ONE = 'one_on_one' as const;
+export const CALENDAR_INVITATION = 'calendar_invitation' as const;
+export const EMAIL_CONFIRMATION = 'email_confirmation' as const;
 export const REJECTED_EVENT_TYPE_KINDS = [
   'group',
   'collective',
@@ -6,6 +8,9 @@ export const REJECTED_EVENT_TYPE_KINDS = [
 ] as const;
 
 export type EventTypeKind = typeof ONE_ON_ONE;
+export type NotificationMode =
+  | typeof CALENDAR_INVITATION
+  | typeof EMAIL_CONFIRMATION;
 
 export type EventType = {
   id: string;
@@ -15,6 +20,7 @@ export type EventType = {
   durationMinutes: number;
   availabilityScheduleId: string;
   kind: EventTypeKind;
+  notificationMode: NotificationMode;
 };
 
 export type CreateEventTypeInput = {
@@ -24,6 +30,7 @@ export type CreateEventTypeInput = {
   durationMinutes: number;
   availabilityScheduleId: string;
   kind: string;
+  notificationMode?: string;
 };
 
 const eventTypes = new Map<string, EventType>();
@@ -67,6 +74,8 @@ export function createEventType(input: CreateEventTypeInput): EventType {
     throw new Error('slug must be unique');
   }
 
+  const notificationMode = resolveNotificationMode(input.notificationMode);
+
   const eventType: EventType = {
     id: crypto.randomUUID(),
     hostId,
@@ -75,6 +84,7 @@ export function createEventType(input: CreateEventTypeInput): EventType {
     durationMinutes: input.durationMinutes,
     availabilityScheduleId,
     kind: ONE_ON_ONE,
+    notificationMode,
   };
   eventTypes.set(eventType.id, eventType);
   slugs.set(slug, eventType.id);
@@ -89,4 +99,19 @@ export function getEventType(id: string): EventType | null {
 export function getEventTypeBySlug(slug: string): EventType | null {
   const id = slugs.get(slug);
   return id ? getEventType(id) : null;
+}
+
+export function resolveNotificationMode(
+  mode?: string | null,
+): NotificationMode {
+  if (mode === undefined || mode === null) {
+    return CALENDAR_INVITATION;
+  }
+  const trimmed = mode.trim();
+  if (trimmed === CALENDAR_INVITATION || trimmed === EMAIL_CONFIRMATION) {
+    return trimmed;
+  }
+  throw new Error(
+    `notificationMode must be "${CALENDAR_INVITATION}" or "${EMAIL_CONFIRMATION}"`,
+  );
 }

@@ -26,6 +26,13 @@ Set these names in the host environment (Vercel / local `.env`). Do not commit s
 
 The Google OAuth app is Internal to the `myoli.co` Workspace. Sign-in also allowlists that hosted domain (`hd`) in code.
 
+Future Gmail send (not used in this slice — names only, no values; confirmation mail stays on the `EmailProvider` mock):
+
+- `GMAIL_CLIENT_ID` — Google Cloud OAuth client id for Gmail API
+- `GMAIL_CLIENT_SECRET` — Google Cloud OAuth client secret for Gmail API
+- `GMAIL_REFRESH_TOKEN` — offline refresh token for the sending mailbox
+- `GMAIL_FROM` — sender address for confirmation mail
+
 - Work orders: copy `docs/PLAN-TEMPLATE.md` to `PLAN.md`, review with the VP of Product, then `agent-os dispatch PLAN.md`.
 - `PROOF_CMD` for this repo: `npm test`
 - Kill switch: label a PR `hold`.
