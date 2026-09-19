@@ -129,7 +129,7 @@ export class BookingNotFoundError extends Error {
 
 export class BookingConflictError extends Error {
   readonly status = 409;
-  constructor(message = SLOT_UNAVAILABLE) {
+  constructor(message: string = SLOT_UNAVAILABLE) {
     super(message);
     this.name = 'BookingConflictError';
   }
