@@ -2,10 +2,10 @@ import { getHostCalendarConnection } from '@/lib/calendar/connection';
 import { createFixtureCalendarProvider } from '@/lib/calendar/google-freebusy';
 import type { CalendarProvider } from '@/lib/calendar/provider';
 import type { GoogleFreeBusyFixture } from '@/lib/calendar/google-freebusy';
-import { getEventTypeBySlug } from '@/lib/availability/event-type';
+import { getEventTypeBySlug, GROUP } from '@/lib/availability/event-type';
 import { getAvailabilitySchedule } from '@/lib/availability/schedule';
 import { listAvailableTimes } from '@/lib/availability/slots';
-import { hostBookingsAsBusy } from '@/lib/booking/booking';
+import { hostBookingsAsBusy, withSpotsRemaining } from '@/lib/booking/booking';
 import fixture from '@/tests/fixtures/google-freebusy.json';
 
 let injectedProvider: CalendarProvider | null = null;
@@ -55,6 +55,11 @@ export async function GET(
   const connection = getHostCalendarConnection(eventType.hostId);
   const calendarId = connection?.destinationCalendarId ?? 'primary';
 
+  const extraBusy = hostBookingsAsBusy(
+    eventType.hostId,
+    eventType.kind === GROUP ? { excludeEventTypeId: eventType.id } : undefined,
+  );
+
   const times = await listAvailableTimes({
     eventType,
     schedule,
@@ -62,8 +67,12 @@ export async function GET(
     timeMax,
     provider: getCalendarProvider(),
     calendarId,
-    extraBusy: hostBookingsAsBusy(eventType.hostId),
+    extraBusy,
   });
+
+  if (eventType.kind === GROUP) {
+    return Response.json({ times: withSpotsRemaining(times, eventType) });
+  }
 
   return Response.json({ times });
 }
