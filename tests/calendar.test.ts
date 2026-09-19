@@ -58,4 +58,25 @@ describe('AC-4 CalendarProvider freeBusy adapter', () => {
       end: '2026-09-20T19:00:00.000Z',
     });
   });
+
+  it('records createEvent on the fixture adapter without live Google', async () => {
+    const fixturePath = path.join(
+      process.cwd(),
+      'tests/fixtures/google-freebusy.json',
+    );
+    const fixture = JSON.parse(
+      readFileSync(fixturePath, 'utf8'),
+    ) as GoogleFreeBusyFixture;
+    const provider = createFixtureCalendarProvider(fixture);
+    const created = await provider.createEvent({
+      calendarId: 'primary',
+      start: '2026-09-20T09:00:00.000Z',
+      end: '2026-09-20T09:30:00.000Z',
+      summary: 'Intro call',
+      attendees: [{ email: 'ada@example.com', displayName: 'Ada' }],
+    });
+    assert.match(created.id, /^mock-event-/);
+    assert.equal(provider.createdEvents.length, 1);
+    assert.equal(provider.createdEvents[0]?.id, created.id);
+  });
 });

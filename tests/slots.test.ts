@@ -17,6 +17,9 @@ function emptyBusyProvider(): CalendarProvider {
     async freeBusy() {
       return [];
     },
+    async createEvent() {
+      return { id: 'mock-unused' };
+    },
   };
 }
 
