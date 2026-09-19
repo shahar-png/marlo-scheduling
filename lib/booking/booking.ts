@@ -1,6 +1,8 @@
 import {
   CALENDAR_INVITATION,
+  COLLECTIVE,
   EMAIL_CONFIRMATION,
+  eventTypeHostIds,
   getEventType,
   GROUP,
   ONE_ON_ONE,
@@ -19,6 +21,7 @@ import {
   LINK_CONSUMED,
 } from '../availability/single-use-link';
 import { listAvailableTimes } from '../availability/slots';
+import { getHostCalendarConnection } from '../calendar/connection';
 import type {
   BusyWindow,
   CalendarAttendee,
@@ -57,6 +60,7 @@ export type Booking = {
   invitee: BookingInvitee;
   calendarEventId: string;
   cancelReason?: string;
+  hostIds?: string[];
 };
 
 export type CreateBookingInput = {
@@ -159,9 +163,26 @@ export function listConfirmedBookingsForHost(hostId: string): Booking[] {
   return [...bookings.values()]
     .filter(
       (booking) =>
-        booking.hostId === hostId && booking.status === BOOKING_CONFIRMED,
+        booking.status === BOOKING_CONFIRMED && bookingAssignsHost(booking, hostId),
     )
     .map(cloneBooking);
+}
+
+function bookingAssignsHost(booking: Booking, hostId: string): boolean {
+  if (booking.hostId === hostId) {
+    return true;
+  }
+  return booking.hostIds?.includes(hostId) ?? false;
+}
+
+export function calendarIdsForHosts(hostIds: string[]): string[] {
+  return hostIds.map(
+    (id) => getHostCalendarConnection(id)?.destinationCalendarId ?? 'primary',
+  );
+}
+
+export function extraBusyForHosts(hostIds: string[]): BusyWindow[] {
+  return hostIds.flatMap((id) => hostBookingsAsBusy(id));
 }
 
 export function hostBookingsAsBusy(
@@ -224,9 +245,13 @@ export function createBooking(input: CreateBookingInput): Booking {
   if (!Number.isFinite(startMs)) {
     throw new BookingValidationError('start must be a valid ISO-8601 instant');
   }
-  if (input.eventType.kind !== ONE_ON_ONE && input.eventType.kind !== GROUP) {
+  if (
+    input.eventType.kind !== ONE_ON_ONE &&
+    input.eventType.kind !== GROUP &&
+    input.eventType.kind !== COLLECTIVE
+  ) {
     throw new BookingValidationError(
-      `kind must be "${ONE_ON_ONE}" or "${GROUP}"; ${input.eventType.kind} bookings are rejected`,
+      `kind must be "${ONE_ON_ONE}", "${GROUP}", or "${COLLECTIVE}"; ${input.eventType.kind} bookings are rejected`,
     );
   }
   if (input.eventType.kind === GROUP) {
@@ -263,6 +288,9 @@ export function createBooking(input: CreateBookingInput): Booking {
     invitee,
     calendarEventId,
   };
+  if (input.eventType.kind === COLLECTIVE) {
+    booking.hostIds = eventTypeHostIds(input.eventType);
+  }
   bookings.set(booking.id, booking);
   return cloneBooking(booking);
 }
@@ -276,9 +304,13 @@ export async function bookAvailableSlot(
     throw new BookingValidationError('start must be a valid ISO-8601 instant');
   }
   const start = new Date(startMs).toISOString();
-  const lockKey = `${input.eventType.hostId}:${start}`;
+  const assignedHosts = eventTypeHostIds(input.eventType);
+  const lockHosts =
+    input.eventType.kind === COLLECTIVE
+      ? assignedHosts
+      : [input.eventType.hostId];
 
-  return withSlotLock(lockKey, async () => {
+  return withHostStartLocks(lockHosts, start, async () => {
     const schedule = input.oneOffMeeting
       ? undefined
       : getAvailabilitySchedule(input.eventType.availabilityScheduleId) ??
@@ -291,12 +323,14 @@ export async function bookAvailableSlot(
       startMs + input.eventType.durationMinutes * 60_000,
     ).toISOString();
 
-    const extraBusy = hostBookingsAsBusy(
-      input.eventType.hostId,
+    const extraBusy =
       input.eventType.kind === GROUP
-        ? { excludeEventTypeId: input.eventType.id }
-        : undefined,
-    );
+        ? hostBookingsAsBusy(input.eventType.hostId, {
+            excludeEventTypeId: input.eventType.id,
+          })
+        : input.eventType.kind === COLLECTIVE
+          ? extraBusyForHosts(assignedHosts)
+          : hostBookingsAsBusy(input.eventType.hostId);
 
     const times = await listAvailableTimes({
       eventType: input.eventType,
@@ -306,6 +340,10 @@ export async function bookAvailableSlot(
       timeMax: end,
       provider: input.provider,
       calendarId: input.calendarId,
+      calendarIds:
+        input.eventType.kind === COLLECTIVE
+          ? calendarIdsForHosts(assignedHosts)
+          : undefined,
       extraBusy,
     });
 
@@ -600,7 +638,25 @@ function cloneBooking(booking: Booking): Booking {
   if (booking.cancelReason !== undefined) {
     cloned.cancelReason = booking.cancelReason;
   }
+  if (booking.hostIds) {
+    cloned.hostIds = [...booking.hostIds];
+  }
   return cloned;
+}
+
+async function withHostStartLocks<T>(
+  hostIds: string[],
+  start: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const keys = [...new Set(hostIds)].sort().map((id) => `${id}:${start}`);
+  const acquire = (index: number): Promise<T> => {
+    if (index >= keys.length) {
+      return fn();
+    }
+    return withSlotLock(keys[index], () => acquire(index + 1));
+  };
+  return acquire(0);
 }
 
 async function withSlotLock<T>(

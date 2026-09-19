@@ -1,13 +1,14 @@
 export const ONE_ON_ONE = 'one_on_one' as const;
 export const GROUP = 'group' as const;
+export const COLLECTIVE = 'collective' as const;
 export const CALENDAR_INVITATION = 'calendar_invitation' as const;
 export const EMAIL_CONFIRMATION = 'email_confirmation' as const;
-export const REJECTED_EVENT_TYPE_KINDS = [
-  'collective',
-  'round_robin',
-] as const;
+export const REJECTED_EVENT_TYPE_KINDS = ['round_robin'] as const;
 
-export type EventTypeKind = typeof ONE_ON_ONE | typeof GROUP;
+export type EventTypeKind =
+  | typeof ONE_ON_ONE
+  | typeof GROUP
+  | typeof COLLECTIVE;
 export type NotificationMode =
   | typeof CALENDAR_INVITATION
   | typeof EMAIL_CONFIRMATION;
@@ -22,6 +23,7 @@ export type EventType = {
   kind: EventTypeKind;
   notificationMode: NotificationMode;
   maxInvitees?: number;
+  hostIds?: string[];
 };
 
 export type CreateEventTypeInput = {
@@ -33,6 +35,7 @@ export type CreateEventTypeInput = {
   kind: string;
   notificationMode?: string;
   maxInvitees?: number;
+  hostIds?: string[];
 };
 
 const eventTypes = new Map<string, EventType>();
@@ -67,9 +70,13 @@ export function createEventType(input: CreateEventTypeInput): EventType {
   ) {
     throw new Error('durationMinutes must be a positive integer');
   }
-  if (input.kind !== ONE_ON_ONE && input.kind !== GROUP) {
+  if (
+    input.kind !== ONE_ON_ONE &&
+    input.kind !== GROUP &&
+    input.kind !== COLLECTIVE
+  ) {
     throw new Error(
-      `kind must be "${ONE_ON_ONE}" or "${GROUP}"; ${input.kind} event types are rejected`,
+      `kind must be "${ONE_ON_ONE}", "${GROUP}", or "${COLLECTIVE}"; ${input.kind} event types are rejected`,
     );
   }
   if (input.kind === GROUP) {
@@ -80,6 +87,10 @@ export function createEventType(input: CreateEventTypeInput): EventType {
       throw new Error('maxInvitees must be a positive integer');
     }
   }
+  const hostIds =
+    input.kind === COLLECTIVE
+      ? normalizeCollectiveHostIds(hostId, input.hostIds)
+      : undefined;
   if (slugs.has(slug)) {
     throw new Error('slug must be unique');
   }
@@ -99,19 +110,57 @@ export function createEventType(input: CreateEventTypeInput): EventType {
   if (input.kind === GROUP) {
     eventType.maxInvitees = input.maxInvitees;
   }
+  if (input.kind === COLLECTIVE && hostIds) {
+    eventType.hostIds = hostIds;
+  }
   eventTypes.set(eventType.id, eventType);
   slugs.set(slug, eventType.id);
-  return { ...eventType };
+  return cloneEventType(eventType);
 }
 
 export function getEventType(id: string): EventType | null {
   const found = eventTypes.get(id);
-  return found ? { ...found } : null;
+  return found ? cloneEventType(found) : null;
 }
 
 export function getEventTypeBySlug(slug: string): EventType | null {
   const id = slugs.get(slug);
   return id ? getEventType(id) : null;
+}
+
+export function eventTypeHostIds(eventType: Pick<EventType, 'hostId' | 'hostIds'>): string[] {
+  if (eventType.hostIds && eventType.hostIds.length > 0) {
+    return [...eventType.hostIds];
+  }
+  return [eventType.hostId];
+}
+
+function normalizeCollectiveHostIds(
+  organizerId: string,
+  hostIds?: string[],
+): string[] {
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of [organizerId, ...(hostIds ?? [])]) {
+    const id = raw.trim();
+    if (!id || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    unique.push(id);
+  }
+  if (unique.length < 2) {
+    throw new Error('hostIds must include at least two unique host ids');
+  }
+  return unique;
+}
+
+function cloneEventType(eventType: EventType): EventType {
+  const cloned: EventType = { ...eventType };
+  if (eventType.hostIds) {
+    cloned.hostIds = [...eventType.hostIds];
+  }
+  return cloned;
 }
 
 export function resolveNotificationMode(

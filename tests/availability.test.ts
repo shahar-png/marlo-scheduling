@@ -93,21 +93,19 @@ describe('AC-2 one-on-one event-type stub', () => {
     assert.deepEqual(getEventTypeBySlug('intro-30'), created);
   });
 
-  it('rejects collective and round_robin kinds', () => {
-    for (const kind of ['collective', 'round_robin'] as const) {
-      assert.throws(
-        () =>
-          createEventType({
-            hostId: 'host-1',
-            slug: `slug-${kind}`,
-            name: 'Nope',
-            durationMinutes: 30,
-            availabilityScheduleId: 'sched-1',
-            kind,
-          }),
-        /rejected/,
-      );
-    }
+  it('rejects round_robin kinds', () => {
+    assert.throws(
+      () =>
+        createEventType({
+          hostId: 'host-1',
+          slug: 'slug-round_robin',
+          name: 'Nope',
+          durationMinutes: 30,
+          availabilityScheduleId: 'sched-1',
+          kind: 'round_robin',
+        }),
+      /rejected/,
+    );
   });
 
   it('rejects a duplicate slug', () => {

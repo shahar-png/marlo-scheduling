@@ -19,6 +19,7 @@ export type ListAvailableTimesInput = {
   timeMax: string;
   provider: CalendarProvider;
   calendarId: string;
+  calendarIds?: string[];
   extraBusy?: BusyWindow[];
 };
 
@@ -34,11 +35,17 @@ export async function listAvailableTimes(
     throw new Error('schedule or oneOffMeeting is required');
   }
 
-  const calendarBusy = await input.provider.freeBusy({
-    calendarId: input.calendarId,
-    timeMin: input.timeMin,
-    timeMax: input.timeMax,
-  });
+  const calendarIds = uniqueCalendarIds(input.calendarIds, input.calendarId);
+  const calendarBusy: BusyWindow[] = [];
+  for (const calendarId of calendarIds) {
+    calendarBusy.push(
+      ...(await input.provider.freeBusy({
+        calendarId,
+        timeMin: input.timeMin,
+        timeMax: input.timeMax,
+      })),
+    );
+  }
   const busy = [...calendarBusy, ...(input.extraBusy ?? [])];
 
   const durationMs = input.eventType.durationMinutes * 60_000;
@@ -133,6 +140,24 @@ function expandOneOffWindows(
       ).getTime(),
     };
   });
+}
+
+function uniqueCalendarIds(
+  calendarIds: string[] | undefined,
+  calendarId: string,
+): string[] {
+  const ids = calendarIds?.length ? calendarIds : [calendarId];
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const id of ids) {
+    const trimmed = id.trim();
+    if (!trimmed || seen.has(trimmed)) {
+      continue;
+    }
+    seen.add(trimmed);
+    unique.push(trimmed);
+  }
+  return unique.length > 0 ? unique : [calendarId];
 }
 
 function overlapsBusy(

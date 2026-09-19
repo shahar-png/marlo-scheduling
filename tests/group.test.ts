@@ -164,21 +164,19 @@ describe('AC-1 group event-type stub', () => {
     );
   });
 
-  it('rejects collective and round_robin kinds', () => {
-    for (const kind of ['collective', 'round_robin'] as const) {
-      assert.throws(
-        () =>
-          createEventType({
-            hostId: 'host-1',
-            slug: `slug-${kind}`,
-            name: 'Nope',
-            durationMinutes: 30,
-            availabilityScheduleId: 'sched-1',
-            kind,
-          }),
-        /rejected/,
-      );
-    }
+  it('rejects round_robin kinds', () => {
+    assert.throws(
+      () =>
+        createEventType({
+          hostId: 'host-1',
+          slug: 'slug-round_robin',
+          name: 'Nope',
+          durationMinutes: 30,
+          availabilityScheduleId: 'sched-1',
+          kind: 'round_robin',
+        }),
+      /rejected/,
+    );
   });
 });
 
