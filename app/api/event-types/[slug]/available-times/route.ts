@@ -2,10 +2,20 @@ import { getHostCalendarConnection } from '@/lib/calendar/connection';
 import { createFixtureCalendarProvider } from '@/lib/calendar/google-freebusy';
 import type { CalendarProvider } from '@/lib/calendar/provider';
 import type { GoogleFreeBusyFixture } from '@/lib/calendar/google-freebusy';
-import { getEventTypeBySlug, GROUP } from '@/lib/availability/event-type';
+import {
+  COLLECTIVE,
+  eventTypeHostIds,
+  getEventTypeBySlug,
+  GROUP,
+} from '@/lib/availability/event-type';
 import { getAvailabilitySchedule } from '@/lib/availability/schedule';
 import { listAvailableTimes } from '@/lib/availability/slots';
-import { hostBookingsAsBusy, withSpotsRemaining } from '@/lib/booking/booking';
+import {
+  calendarIdsForHosts,
+  extraBusyForHosts,
+  hostBookingsAsBusy,
+  withSpotsRemaining,
+} from '@/lib/booking/booking';
 import fixture from '@/tests/fixtures/google-freebusy.json';
 
 let injectedProvider: CalendarProvider | null = null;
@@ -52,13 +62,19 @@ export async function GET(
     );
   }
 
+  const hostIds = eventTypeHostIds(eventType);
   const connection = getHostCalendarConnection(eventType.hostId);
   const calendarId = connection?.destinationCalendarId ?? 'primary';
 
-  const extraBusy = hostBookingsAsBusy(
-    eventType.hostId,
-    eventType.kind === GROUP ? { excludeEventTypeId: eventType.id } : undefined,
-  );
+  const extraBusy =
+    eventType.kind === COLLECTIVE
+      ? extraBusyForHosts(hostIds)
+      : hostBookingsAsBusy(
+          eventType.hostId,
+          eventType.kind === GROUP
+            ? { excludeEventTypeId: eventType.id }
+            : undefined,
+        );
 
   const times = await listAvailableTimes({
     eventType,
@@ -67,6 +83,8 @@ export async function GET(
     timeMax,
     provider: getCalendarProvider(),
     calendarId,
+    calendarIds:
+      eventType.kind === COLLECTIVE ? calendarIdsForHosts(hostIds) : undefined,
     extraBusy,
   });
 
