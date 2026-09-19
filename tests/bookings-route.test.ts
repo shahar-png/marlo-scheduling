@@ -163,6 +163,8 @@ describe('AC-5 POST /api/event-types/:slug/bookings', () => {
         return inner.freeBusy(query);
       },
       createEvent: (event) => inner.createEvent(event),
+      updateEvent: (event) => inner.updateEvent(event),
+      deleteEvent: (event) => inner.deleteEvent(event),
     });
 
     const [first, second] = await Promise.all([

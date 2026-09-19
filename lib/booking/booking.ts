@@ -1,9 +1,15 @@
-import { ONE_ON_ONE, type EventType } from '../availability/event-type';
+import { getEventType, ONE_ON_ONE, type EventType } from '../availability/event-type';
 import { getAvailabilitySchedule } from '../availability/schedule';
 import { listAvailableTimes } from '../availability/slots';
 import type { BusyWindow, CalendarProvider } from '../calendar/provider';
+import { cancelReminderJobs } from './reminders';
 
 export const BOOKING_CONFIRMED = 'confirmed' as const;
+export const BOOKING_CANCELLED = 'cancelled' as const;
+
+export type BookingStatus =
+  | typeof BOOKING_CONFIRMED
+  | typeof BOOKING_CANCELLED;
 
 export type BookingInvitee = {
   name: string;
@@ -16,9 +22,10 @@ export type Booking = {
   hostId: string;
   start: string;
   end: string;
-  status: typeof BOOKING_CONFIRMED;
+  status: BookingStatus;
   invitee: BookingInvitee;
   calendarEventId: string;
+  cancelReason?: string;
 };
 
 export type CreateBookingInput = {
@@ -32,6 +39,20 @@ export type BookAvailableSlotInput = {
   eventType: EventType;
   start: string;
   invitee: BookingInvitee;
+  provider: CalendarProvider;
+  calendarId: string;
+};
+
+export type RescheduleBookingInput = {
+  bookingId: string;
+  start: string;
+  provider: CalendarProvider;
+  calendarId: string;
+};
+
+export type CancelBookingInput = {
+  bookingId: string;
+  reason: string;
   provider: CalendarProvider;
   calendarId: string;
 };
@@ -75,7 +96,10 @@ export function getBooking(id: string): Booking | null {
 
 export function listConfirmedBookingsForHost(hostId: string): Booking[] {
   return [...bookings.values()]
-    .filter((booking) => booking.hostId === hostId)
+    .filter(
+      (booking) =>
+        booking.hostId === hostId && booking.status === BOOKING_CONFIRMED,
+    )
     .map(cloneBooking);
 }
 
@@ -181,6 +205,112 @@ export async function bookAvailableSlot(
   });
 }
 
+export async function rescheduleBooking(
+  input: RescheduleBookingInput,
+): Promise<Booking> {
+  const startMs = Date.parse(input.start);
+  if (!Number.isFinite(startMs)) {
+    throw new BookingValidationError('start must be a valid ISO-8601 instant');
+  }
+  const start = new Date(startMs).toISOString();
+
+  const existing = bookings.get(input.bookingId);
+  if (!existing) {
+    throw new BookingNotFoundError('booking not found');
+  }
+  if (existing.status !== BOOKING_CONFIRMED) {
+    throw new BookingValidationError('only confirmed bookings can be rescheduled');
+  }
+
+  const lockKey = `${existing.hostId}:${start}`;
+
+  return withSlotLock(lockKey, async () => {
+    const current = bookings.get(input.bookingId);
+    if (!current) {
+      throw new BookingNotFoundError('booking not found');
+    }
+    if (current.status !== BOOKING_CONFIRMED) {
+      throw new BookingValidationError(
+        'only confirmed bookings can be rescheduled',
+      );
+    }
+
+    const eventType = getEventType(current.eventTypeId);
+    if (!eventType) {
+      throw new BookingNotFoundError('event type not found');
+    }
+    const schedule = getAvailabilitySchedule(eventType.availabilityScheduleId);
+    if (!schedule) {
+      throw new BookingNotFoundError('availability schedule not found');
+    }
+
+    const end = new Date(
+      startMs + eventType.durationMinutes * 60_000,
+    ).toISOString();
+
+    const extraBusy = listConfirmedBookingsForHost(current.hostId)
+      .filter((booking) => booking.id !== current.id)
+      .map((booking) => ({ start: booking.start, end: booking.end }));
+
+    const times = await listAvailableTimes({
+      eventType,
+      schedule,
+      timeMin: start,
+      timeMax: end,
+      provider: input.provider,
+      calendarId: input.calendarId,
+      extraBusy,
+    });
+
+    if (!times.includes(start)) {
+      throw new BookingConflictError();
+    }
+
+    await input.provider.updateEvent({
+      calendarId: input.calendarId,
+      eventId: current.calendarEventId,
+      start,
+      end,
+      summary: eventType.name,
+      attendees: [
+        { email: current.invitee.email, displayName: current.invitee.name },
+      ],
+    });
+
+    current.start = start;
+    current.end = end;
+    cancelReminderJobs(current.id);
+    return cloneBooking(current);
+  });
+}
+
+export async function cancelBooking(
+  input: CancelBookingInput,
+): Promise<Booking> {
+  const reason = input.reason.trim();
+  if (!reason) {
+    throw new BookingValidationError('cancel reason is required');
+  }
+
+  const booking = bookings.get(input.bookingId);
+  if (!booking) {
+    throw new BookingNotFoundError('booking not found');
+  }
+  if (booking.status !== BOOKING_CONFIRMED) {
+    throw new BookingValidationError('only confirmed bookings can be cancelled');
+  }
+
+  await input.provider.deleteEvent({
+    calendarId: input.calendarId,
+    eventId: booking.calendarEventId,
+  });
+
+  booking.status = BOOKING_CANCELLED;
+  booking.cancelReason = reason;
+  cancelReminderJobs(booking.id);
+  return cloneBooking(booking);
+}
+
 function normalizeInvitee(invitee: BookingInvitee): BookingInvitee {
   const name = invitee.name.trim();
   const email = invitee.email.trim();
@@ -197,10 +327,14 @@ function normalizeInvitee(invitee: BookingInvitee): BookingInvitee {
 }
 
 function cloneBooking(booking: Booking): Booking {
-  return {
+  const cloned: Booking = {
     ...booking,
     invitee: { ...booking.invitee },
   };
+  if (booking.cancelReason !== undefined) {
+    cloned.cancelReason = booking.cancelReason;
+  }
+  return cloned;
 }
 
 async function withSlotLock<T>(

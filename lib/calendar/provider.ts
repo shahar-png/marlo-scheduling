@@ -22,6 +22,20 @@ export type CalendarEventInput = {
   attendees?: CalendarAttendee[];
 };
 
+export type CalendarEventPatch = {
+  calendarId: string;
+  eventId: string;
+  start: string;
+  end: string;
+  summary?: string;
+  attendees?: CalendarAttendee[];
+};
+
+export type CalendarEventDelete = {
+  calendarId: string;
+  eventId: string;
+};
+
 export type CreatedCalendarEvent = {
   id: string;
 };
@@ -29,4 +43,6 @@ export type CreatedCalendarEvent = {
 export interface CalendarProvider {
   freeBusy(query: FreeBusyQuery): Promise<BusyWindow[]>;
   createEvent(event: CalendarEventInput): Promise<CreatedCalendarEvent>;
+  updateEvent(event: CalendarEventPatch): Promise<CreatedCalendarEvent>;
+  deleteEvent(event: CalendarEventDelete): Promise<void>;
 }
