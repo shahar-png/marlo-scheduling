@@ -26,6 +26,12 @@ import type {
 import { dispatchBookingNotification } from '../notify/dispatch';
 import type { EmailProvider } from '../notify/email';
 import { getBookingEmailProvider } from '../notify/email-runtime';
+import { deliverBookingWebhook } from '../webhooks/deliver';
+import {
+  BOOKING_CANCELED as WEBHOOK_BOOKING_CANCELED,
+  BOOKING_CREATED as WEBHOOK_BOOKING_CREATED,
+  BOOKING_RESCHEDULED as WEBHOOK_BOOKING_RESCHEDULED,
+} from '../webhooks/subscription';
 import { cancelReminderJobs } from './reminders';
 
 export const BOOKING_CONFIRMED = 'confirmed' as const;
@@ -265,6 +271,10 @@ export async function bookAvailableSlot(
       mode,
       emailProvider: input.emailProvider ?? getBookingEmailProvider(),
     });
+    await deliverBookingWebhook({
+      booking,
+      event: WEBHOOK_BOOKING_CREATED,
+    });
     return booking;
   });
 }
@@ -385,6 +395,10 @@ export async function rescheduleBooking(
       mode,
       emailProvider: input.emailProvider ?? getBookingEmailProvider(),
     });
+    await deliverBookingWebhook({
+      booking: updated,
+      event: WEBHOOK_BOOKING_RESCHEDULED,
+    });
     return updated;
   });
 }
@@ -421,6 +435,10 @@ export async function cancelBooking(
     action: 'cancel',
     mode,
     emailProvider: input.emailProvider ?? getBookingEmailProvider(),
+  });
+  await deliverBookingWebhook({
+    booking: cancelled,
+    event: WEBHOOK_BOOKING_CANCELED,
   });
   return cancelled;
 }
