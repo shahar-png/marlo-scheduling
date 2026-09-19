@@ -219,7 +219,8 @@ export async function bookAvailableSlot(
   return withSlotLock(lockKey, async () => {
     const schedule = input.oneOffMeeting
       ? undefined
-      : getAvailabilitySchedule(input.eventType.availabilityScheduleId);
+      : getAvailabilitySchedule(input.eventType.availabilityScheduleId) ??
+        undefined;
     if (!input.oneOffMeeting && !schedule) {
       throw new BookingNotFoundError('availability schedule not found');
     }
