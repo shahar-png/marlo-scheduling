@@ -6,7 +6,7 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "test:unit": "tsx --test tests/app.test.tsx tests/auth.test.ts tests/host.test.tsx tests/calendar.test.ts tests/readme.test.ts",
+    "test:unit": "tsx --test tests/app.test.tsx tests/auth.test.ts tests/host.test.tsx tests/calendar.test.ts tests/readme.test.ts tests/availability.test.ts tests/slots.test.ts tests/available-times.test.ts",
     "test": "node scripts/proof.cjs"
   },
   "dependencies": {
