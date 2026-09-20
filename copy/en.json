@@ -1,0 +1,160 @@
+{
+  "_meta": { "locale": "en", "format": "ICU MessageFormat", "version": "1.0", "note": "Every user-facing string lives here. No hard-coded copy in components. Variables in braces." },
+
+  "brand": {
+    "name": "Marlo",
+    "poweredBy": "Scheduled with Marlo"
+  },
+
+  "booking": {
+    "headline": "Grab time with {hostFirstName}",
+    "timesShownIn": "Times shown in {timezoneLabel}",
+    "changeTimezone": "Change",
+    "emptyMonth": "Nothing open this month. Try the next one.",
+    "loadingSlots": "Finding open times…",
+    "spotsLeft": "{count, plural, one {# spot left} other {# spots left}}",
+    "next": "Next",
+    "reschedulePolicy": "Need to move it? You can reschedule or cancel up to {hours, plural, one {# hour} other {# hours}} before.",
+    "prevMonth": "Previous month",
+    "nextMonth": "Next month",
+    "hourFormat12": "12h",
+    "hourFormat24": "24h",
+    "locationMeet": "Google Meet · link in your invite",
+    "locationPhoneHostCalls": "Phone · {hostFirstName} calls you",
+    "locationPhoneInviteeCalls": "Phone · you call {hostFirstName}",
+    "locationInPerson": "In person · {address}",
+    "duration": "{minutes} min"
+  },
+
+  "details": {
+    "headline": "Almost there.",
+    "change": "Change",
+    "back": "Back to times",
+    "name": "Name",
+    "email": "Email",
+    "phone": "Phone",
+    "addGuests": "Add guests",
+    "guestsLabel": "Guest emails",
+    "optional": "(optional)",
+    "submit": "Lock it in",
+    "footnote": "Your invite goes to your email. Reschedule anytime from it.",
+    "consent": "{consentText}",
+    "errors": {
+      "required": "Needed to book.",
+      "email": "That email doesn't look right.",
+      "phone": "Use a full number with country code.",
+      "guestsMax": "Up to {max} guests.",
+      "slotTaken": "That one just went. Pick another.",
+      "sessionFull": "That session just filled up. Here's what's still open.",
+      "generic": "Something broke on our side. Try again."
+    }
+  },
+
+  "confirmation": {
+    "headline": "Handled.",
+    "subhead": "You're on {hostFirstName}'s calendar. Invite's on its way to {inviteeEmail}.",
+    "with": "With",
+    "where": "Where",
+    "youSaid": "You said",
+    "bothSameZone": "{minutes} min · you're both on {timezoneLabel}.",
+    "differentZones": "{minutes} min · {hostTime} for {hostFirstName}.",
+    "addToCalendar": "Add to calendar",
+    "google": "Google", "outlook": "Outlook", "office365": "Office 365", "ics": ".ics",
+    "reschedule": "Reschedule",
+    "cancel": "Cancel",
+    "meetLinkPending": "link is in your invite"
+  },
+
+  "reschedule": {
+    "banner": "Moving your {eventName} from {oldTime}.",
+    "reasonLabel": "Why the move? (optional)",
+    "submit": "Move it",
+    "done": "Moved. New time: {newTime}.",
+    "blocked": "Too close to change online. Email {hostFirstName} and we'll sort it."
+  },
+
+  "cancel": {
+    "headline": "Cancel this one?",
+    "reasonLabel": "Let {hostFirstName} know why (optional)",
+    "keep": "Keep it",
+    "submit": "Cancel meeting",
+    "done": "Canceled. {hostFirstName} knows.",
+    "bookAgain": "Book a new time"
+  },
+
+  "states": {
+    "eventOff": "{hostFirstName} isn't taking bookings right now.",
+    "linkUsed": "This link's been used.",
+    "linkUsedCta": "Want another time?",
+    "calendarDisconnected": "{hostFirstName}'s calendar is disconnected. We've let them know.",
+    "notFound": "Nothing here. Check the link."
+  },
+
+  "app": {
+    "nav": { "eventTypes": "Event types", "meetings": "Meetings", "availability": "Availability", "workflows": "Workflows", "routing": "Routing", "contacts": "Contacts", "integrations": "Integrations", "admin": "Admin", "create": "Create" },
+    "eventTypes": {
+      "title": "Event types",
+      "summary": "{active, plural, one {# active} other {# active}} · {secret, plural, =0 {} one {# secret} other {# secret}} · {calendarStatus}",
+      "calendarConnected": "Google Calendar connected",
+      "calendarDisconnected": "Calendar disconnected — reconnect",
+      "search": "Search",
+      "copyMyLink": "Copy my link",
+      "copyLink": "Copy link",
+      "copied": "Copied",
+      "shareTimes": "Share times",
+      "singleUse": "Single-use link",
+      "turnOn": "Turn on",
+      "turnOff": "Turn off",
+      "more": "More",
+      "secret": "Secret",
+      "off": "Off",
+      "adminManaged": "Admin managed",
+      "bookedThisMonth": "{count, plural, one {# booked this month} other {# booked this month}}",
+      "directLinkOnly": "direct link only",
+      "notAccepting": "not accepting bookings",
+      "filters": { "mine": "Mine", "allUsers": "All users" },
+      "kinds": { "one_on_one": "One-on-one", "group": "Group", "collective": "Collective", "round_robin": "Round robin", "one_off": "One-off" }
+    },
+    "today": {
+      "title": "Today",
+      "inMinutes": "In {minutes} min",
+      "joinMeet": "Join Meet",
+      "thisWeek": "This week",
+      "booked": "{count} booked",
+      "rescheduledNoShows": "{rescheduled} rescheduled · {noShows} no-shows"
+    }
+  },
+
+  "extension": {
+    "tabs": { "shareTimes": "Share times", "insertLink": "Insert link", "oneOff": "One-off", "singleUse": "Single-use", "poll": "Poll" },
+    "selectedCount": "{count, plural, one {# time} other {# times}} selected · live from your calendar",
+    "insert": "Insert into email",
+    "insertLeadIn": "Pick a time that works:",
+    "orAnyTime": "Or pick any time:",
+    "allTimes": "All times {timezoneAbbr}",
+    "keywordChip": "Share times?",
+    "close": "Close",
+    "prevWeek": "Previous week",
+    "nextWeek": "Next week"
+  },
+
+  "email": {
+    "confirmSubject": "Handled: {eventName} with {hostFirstName} — {eventDate}",
+    "reminderTomorrowSubject": "Tomorrow: {eventName} with {hostFirstName}",
+    "reminderHourSubject": "In an hour: {eventName}",
+    "canceledSubject": "Canceled: {eventName} on {eventDate}",
+    "rescheduledSubject": "Moved: {eventName} → {eventDate} {eventTime}",
+    "headline": "Handled.",
+    "intro": "{inviteeFirstName}, you're on {hostFirstName}'s calendar. Everything you need is below.",
+    "what": "What", "when": "When", "where": "Where", "who": "Who",
+    "join": "Join Google Meet",
+    "youSaid": "You said:",
+    "reschedule": "Reschedule", "cancel": "Cancel", "addToCalendar": "Add to calendar",
+    "replyHint": "Reply to reach {hostFirstName} directly",
+    "footer": "Scheduled with Marlo"
+  },
+
+  "sms": {
+    "reminder": "Marlo: {eventName} with {hostFirstName} tomorrow at {eventTime} {timezoneAbbr}. Change it: {shortUrl}"
+  }
+}
