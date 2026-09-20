@@ -14,14 +14,7 @@ npm run dev
 - `npm test` — PROOF_CMD: typecheck, `next build`, and automated tests
 - `npm run dev` — start the Next.js App Router app locally
 
-`GET /` serves the branded Marlo Scheduling landing page (cream/ink/lime tokens, Logo) and links to the bookable demo. `GET /api/health` returns `{ "ok": true }`.
-
-## Public booking (demo)
-
-- `/demo/intro-30` — public booking page for the seeded demo event type (`intro-30`, "Intro call", 30 min, weekdays 09:00–20:00 UTC). The demo fixtures are seeded on request (`lib/demo/seed.ts`) so the in-memory store is never empty in production.
-- `/b/{token}` — branded confirmation shell after a booking (token = booking id). It renders even when the in-memory row is missing on another serverless isolate.
-- Brand assets are copied from the in-repo handoff (`handoff/` is the design source of truth; never edit it in an implementation PR): `copy/en.json`, `app/tokens/marlo.css`, and the inline SVG `Logo` in `app/components/Logo.tsx`.
-- `lib/api/` is the only module that knows the backend routes; components never call `fetch`. Handoff §7 vs repo differences (paths, shapes, the missing idempotency key) are logged in `lib/api/DIVERGENCES.md`.
+`GET /` serves the Marlo Scheduling placeholder. `GET /api/health` returns `{ "ok": true }`.
 
 ## Environment variables
 

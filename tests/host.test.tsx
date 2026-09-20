@@ -35,9 +35,6 @@ describe('AC-2 protected host route and sign-in', () => {
       isAuthorizedForPath(null, '/api/event-types/intro-30/bookings'),
       true,
     );
-    assert.equal(isAuthorizedForPath(null, '/demo/intro-30'), true);
-    assert.equal(isAuthorizedForPath(null, '/b/some-booking-token'), true);
-    assert.equal(isAuthorizedForPath(null, '/api/bookings/some-id'), true);
   });
 
   it('renders a Google sign-in control on the sign-in route', () => {

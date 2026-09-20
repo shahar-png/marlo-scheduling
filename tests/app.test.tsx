@@ -7,21 +7,9 @@ import HomePage from '../app/page';
 import { GET } from '../app/api/health/route';
 
 describe('home page', () => {
-  it('renders branded Marlo Scheduling chrome (tokens + Logo) and links to the demo', () => {
+  it('renders Marlo Scheduling placeholder copy', () => {
     const html = renderToStaticMarkup(<HomePage />);
     assert.match(html, /Marlo Scheduling/);
-    assert.match(html, /data-logo="wordmark"/);
-    assert.match(html, /marlo-page/);
-    assert.match(html, /marlo-btn--primary/);
-    assert.match(html, /href="\/demo\/intro-30"/);
-    assert.doesNotMatch(html, /Placeholder/);
-    assert.doesNotMatch(html, /placeholder/);
-  });
-
-  it('the homepage source is not placeholder-only', () => {
-    const source = readFileSync(path.join(process.cwd(), 'app/page.tsx'), 'utf8');
-    assert.doesNotMatch(source, /Placeholder — the first scheduling slice/);
-    assert.match(source, /Logo/);
   });
 });
 
@@ -35,12 +23,10 @@ describe('GET /api/health', () => {
 });
 
 describe('README', () => {
-  it('documents npm ci, npm test, npm run dev, and the demo booking path', () => {
+  it('documents npm ci, npm test, and npm run dev', () => {
     const readme = readFileSync(path.join(process.cwd(), 'README.md'), 'utf8');
     assert.match(readme, /npm ci/);
     assert.match(readme, /npm test/);
     assert.match(readme, /npm run dev/);
-    assert.match(readme, /\/demo\/intro-30/);
-    assert.match(readme, /\/b\/\{token\}/);
   });
 });
