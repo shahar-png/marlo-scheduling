@@ -1,28 +1,23 @@
-> Supersedes the completed GRP PLAN (shipped @ `1422ff4`, PLAN PR #17 @ `b7a65de`). That slice is done: `kind: "group"` + `maxInvitees`, `spots_remaining` on available_times, last-spot `session_full` race. This work order is the next v1 slice only — **collective event type (COL)**.
+> Supersedes the completed COL PLAN (shipped @ `f67bafc`, PLAN PR #20 @ `e6a4c92`). That slice is done: `kind: "collective"` + multi-host intersection + all-hosts booking. This work order is the next v1 slice only — **public booking page front-end (BOOK-FE)**.
 
-# PLAN — Collective event type (COL) — all hosts must be free
+# PLAN — Public booking page front-end (BOOK-FE)
 
-Spec owner: Shahar + VP of Product · Product review: Shahar + Grok · Status: APPROVED (Founder continuous go + VP Product, 19 Sep 2026 ET) — Founder said keep going after the GRP slice.
+Spec owner: Shahar + VP of Product · Product review: Shahar + Grok · Status: APPROVED Founder go + VP Product, 20 Sep 2026 ET
 
 ## Goal
 
-Hosts on `marlo-scheduling` can define a **collective** event type (`kind: "collective"`) with **multiple hosts**. Guests querying **available_times** see a start only when **every** assigned host is free (intersection of weekly hours minus each host’s `CalendarProvider.freeBusy` and confirmed bookings). Booking create **assigns all hosts** — each becomes busy on that start. Busy-edge cases (one host busy hides the slot for everyone) are covered — spec AC-06 spirit. After this ships, panel-style meetings work without round robin, managed events, or payments.
+An invitee can open a **public booking route**, pick a date/slot, enter name/email, and confirm a booking — **Marlo-branded UI** from the FE handoff — wired to the **existing** in-repo booking APIs. `https://marlo-scheduling.vercel.app` is no longer a placeholder-only homepage: `/` is branded cream/ink/lime chrome that links to a bookable demo, and `/{slug}/{event}` is a real booking page. After confirm, `/b/{token}` shows a branded “Handled.” confirmation shell. All handoff↔repo mapping lives in `lib/api/` (components never `fetch`).
 
 ## Non-goals
 
-- Round-robin event types
-- Managed events (host-managed guest lists / admin seat assignment)
-- Payments, deposits, or paid event types
-- Changing group `spots_remaining` / `session_full` semantics or 1:1 `{ times: string[] }` shape
-- Per-host weekly schedules (collective reuses the event type’s one `availabilityScheduleId`; intersection is calendar + booking busy, not different weekday hours)
-- New reschedule/cancel semantics (existing BOOK-lifecycle paths stay; a cancelled collective booking stops occupying hosts because only `confirmed` rows count)
-- Zapier, live internet HTTP, `routing_form` events
-- Chrome extension, InboxSDK, embeds
-- Live email / real Gmail send (keep the existing `EmailProvider` mock + `notification_log`)
-- Outlook / Microsoft 365 calendar
+- Host dashboard / NavRail / event-type editor
+- Gmail extension, MJML emails, Storybook, Playwright E2E, Sentry, TanStack Query (unless a tiny helper is strictly required — prefer none)
+- Live Google OAuth / Neon / real calendar — keep mocks and in-memory stubs
+- Full a11y/Lighthouse gate from handoff §9 (basic keyboard focus is ok; axe is not required this slice)
+- Changing existing backend booking semantics except **thin public route adapters** (e.g. a GET-by-id for confirmation)
+- Reschedule/cancel UI (`/b/{token}/reschedule`, `/b/{token}/cancel`)
+- Adding Zod, Radix, `react-intl`, Tailwind, or date-fns **unless** CSS tokens + a tiny copy helper cannot ship the slice
 - Changing `.github/`, branch protection, or the `PROOF_CMD` name (`npm test` stays)
-- Live Google Calendar writes (or live OAuth) required in CI — keep mocked `createEvent` / `updateEvent` / `deleteEvent` and the freeBusy fixture
-- Neon/Prisma (in-memory stubs only)
 
 ## Acceptance criteria
 
@@ -30,39 +25,71 @@ Every criterion is observed **only** via `PROOF_CMD` (`npm test`). The existing 
 
 | ID | Criterion | How it is observed |
 |---|---|---|
-| AC-1 | Event-type stub accepts `kind: "collective"` with a required `hostIds` array of **at least two** unique non-empty host ids. The organizer `hostId` must be included in `hostIds` (or is auto-included). Create/read returns `kind: "collective"` and that host list. Missing, empty, single-host, blank, or duplicate-only `hostIds` is rejected. `round_robin` stays rejected. Existing `one_on_one` and `group` create/read are unchanged (`hostIds` not required). `resetEventTypes()` for tests. No production DB. | Solely `PROOF_CMD` (`npm test`) — unit tests for stub create/read/reject (in-memory is fine) |
-| AC-2 | For a collective event type, available times are the **intersection**: a start is listed only when it lies in the bound schedule **and** **no** assigned host is busy. A start is omitted if **any** host has `CalendarProvider.freeBusy` overlap (per that host’s destination calendar, else `"primary"`) **or** a confirmed booking overlap. 1:1 `listAvailableTimes` still returns `string[]`. Group `spots_remaining` is unchanged. | Solely `PROOF_CMD` (`npm test`) — unit tests composing collective event type + schedule + per-host fixture calendars + booking stub |
-| AC-3 | Booking create for a collective type succeeds when all hosts are free. The persisted booking **assigns all hosts** (`hostIds` on the booking equals the event type’s hosts). After confirm, each assigned host is busy: that host’s 1:1 (and any other collective that includes them) omits the start. A start outside weekly hours or where **any** host is busy remains HTTP **409** `slot_unavailable`. Group `session_full` and 1:1 `slot_unavailable` stay unchanged. | Solely `PROOF_CMD` (`npm test`) — unit tests for all-hosts-free success, any-host-busy `slot_unavailable`, and persisted `hostIds` |
-| AC-4 | **Busy-edge cases (spec AC-06 spirit):** Host A free + Host B calendar-busy → start omitted. Host A free + Host B confirmed booking → start omitted. Partial overlap on one host hides every slot that intersects that busy window. Both hosts free → start present. Fixture busy on Host A’s `primary` (Sunday 2026-09-20 `14:00–15:00`) hides that start even if Host B is free. Two overlapping creates for the same collective start yield exactly **one** confirmed success and **one** HTTP 409 `slot_unavailable`. No double-assign of the same hosts. Serialization is required (lock every assigned host’s `(hostId, start)`), not a naive check-then-act. | Solely `PROOF_CMD` (`npm test`) — per-host busy fixtures + `Promise.all` of two concurrent creates; assert `{fulfilled, slot_unavailable}` and one persisted confirmed row |
-| AC-5 | `GET /api/event-types/:slug/available-times` for a **collective** slug returns `{ times: string[] }` of intersection starts (1:1 shape, not group `{ start, spots_remaining }`). `POST /api/event-types/:slug/bookings` on that slug assigns all hosts (201 + booking.`hostIds`) when all are free; 409 `slot_unavailable` when any host is busy. Tests call handlers directly (no live server, no live Google). Existing 1:1 GET `{ times: string[] }`, group GET shape, `/`, and `/api/health` stay public. The superseded tests that rejected `kind: "collective"` are updated — that non-goal is retired for **collective only**. | Solely `PROOF_CMD` (`npm test`) — handler unit tests + assert the old “reject collective kind” assertion is gone |
+| AC-1 | `PLAN.md` on main describes this FE slice with APPROVED status (Founder go + VP Product, 20 Sep 2026 ET) and `PROOF_CMD`=`npm test`. | This docs PR lands that text. Implementation PR does not rewrite the work order. Solely `PROOF_CMD` (`npm test`) — existing tests stay green on this docs-only change |
+| AC-2 | Brand assets land (Logo mark/wordmark via `currentColor` / tokens). Homepage or booking chrome uses cream/ink/lime tokens. Homepage is no longer placeholder-only as the sole public UX: it is branded and links to a bookable demo (`/demo/intro-30`). | Solely `PROOF_CMD` (`npm test`) — `tests/app.test.tsx` (and/or a booking-page render test) assert token/logo usage + demo link; no “placeholder-only” homepage |
+| AC-3 | `lib/api` exports typed helpers for slots + create booking. `lib/api/DIVERGENCES.md` lists handoff §7 vs repo path/shape diffs (`/public/...` vs `/api/event-types/:slug/...`, `{ times }` vs `{ days }`, booking `id` vs `token`, `error` vs `code`). Components never call `fetch`. | Solely `PROOF_CMD` (`npm test`) — adapter unit tests + a grep/source assertion that `app/**/*.tsx` pages/components do not contain `fetch(` |
+| AC-4 | Selecting an available slot and submitting name+email creates a booking through the **existing** booking service. Happy path 201 + 409 `slot_unavailable` are covered. Mapping of 409 `{ error: "slot_unavailable" }` stays in `lib/api`. | Solely `PROOF_CMD` (`npm test`) — adapter + route tests call the existing POST handler (or `bookAvailableSlot`) via `lib/api`; assert 201 confirmed + 409 `slot_unavailable` |
+| AC-5 | Confirmation route `/b/{token}` renders for a booking token. Copy comes from `copy/en.json`. The page file must not contain a hard-coded `"Handled."` string. Brand tokens + Logo on the shell. | Solely `PROOF_CMD` (`npm test`) — render the confirmation page with a token; assert `copy.confirmation.headline` appears and the page source has no literal `Handled.` |
+| AC-6 | Existing tests stay green. Add focused tests for adapter + booking UI/route (`tsx --test` style already used). `package.json` `test:unit` lists the new files. README documents the demo path `/demo/intro-30`. | Solely `PROOF_CMD` (`npm test`) — full existing suite + new files; README assertion for the demo slug/path |
 
 ## Builder
 
-BUILDER: claude — extending the in-memory event-type stub + multi-host freeBusy union + per-host slot locks + App Router GET/POST fit the Claude implement lane. Inspector: codex (separate). Judge: Grok via agent-os.
+BUILDER: claude — public App Router pages + `lib/api` adapters + branded CSS tokens + existing handler wiring fit the Claude implement lane. Inspector spirit: keep `proof` green. Judge: merge only when `npm test` passes.
 
 ## Approach
 
-1. Extend `lib/availability/event-type.ts` — allow `kind: "collective"` alongside `one_on_one` and `group`. Add optional `hostIds?: string[]` on `EventType` (required when `kind === "collective"`; omit on 1:1 / group). Normalize: trim, drop blanks, dedupe, require ≥ 2 unique ids, ensure `hostId` is in the list (prepend if missing). Reject missing / empty / single-host / blank-only `hostIds` for collective. Keep rejecting `round_robin` (and any other kind). `REJECTED_EVENT_TYPE_KINDS` becomes `['round_robin']`. Do not require Neon/Prisma.
-2. Extend `lib/booking/booking.ts` — `Booking` gains optional `hostIds?: string[]`. `createBooking` / `bookAvailableSlot` accept collective types. Persist `hostIds` from the event type. `listConfirmedBookingsForHost(hostId)` includes a confirmed booking when `booking.hostId === hostId` **or** `booking.hostIds` contains that host (so a collective booking occupies every assigned host). 1:1 and group rows stay single-`hostId`.
-3. Add `listHostIds(eventType)` / `busyWindowsForHosts(hostIds, { provider, timeMin, timeMax, extraBusy })` (names may vary). For each host: `freeBusy` on `getHostCalendarConnection(hostId)?.destinationCalendarId ?? "primary"`, plus `hostBookingsAsBusy(hostId)`. Union those windows. Collective `listAvailableTimes` uses the event type’s one schedule and this **union** as busy (intersection of free time). 1:1 / group callers keep today’s single-host extraBusy.
-4. Slot lock: acquire the existing per-`(hostId, start)` lock for **every** assigned host (stable sorted order) before check+insert, so a 1:1 on host B cannot race a collective that includes B. After the lock: re-validate the start against the collective intersection; if missing → `slot_unavailable`; else `createEvent` (organizer calendar, existing notify/webhook hooks) + persist `confirmed` with `hostIds`.
-5. Update `GET app/api/event-types/[slug]/available-times/route.ts`: if the slug is collective, compose multi-host busy and return `{ times: string[] }`. Update `POST .../bookings` only as needed so the persisted booking includes `hostIds` (existing `BookingConflictError` → 409 is enough).
-6. Extend `tests/` (same Node test runner) so AC-1..5 are covered by `npm run test:unit` (`tests/collective.test.ts` + `tests/collective-route.test.ts`). Use Sunday **2026-09-20** UTC slots (`09:00` / `09:30` / `14:00`) and `tests/fixtures/google-freebusy.json` for Host A `primary`. Give Host B a **distinct** `calendarId` (and/or `extraBusy`) so one-host-busy is observable. Update `tests/availability.test.ts` and `tests/group.test.ts` so they no longer expect `kind: "collective"` to be rejected; keep rejecting `round_robin`. Update `tests/booking.test.ts` so the “non-one-on-one” reject covers `round_robin`, not collective. Update `package.json` `test:unit` to include the new files. Do not change `PROOF_CMD`; do not edit `.github/`.
-7. Auth stubs: collective available-times GET and booking POST stay public (guest-facing). If an AC cannot be observed without live Google, report it as impossible rather than adding a manual AC.
+1. **Copy brand assets into the app** (handoff is the design source of truth):
+   - `copy/en.json` ← uploads/handoff copy (ICU keys). A tiny `lib/copy.ts` reader (`t(path, vars?)`) — no `react-intl` unless already present.
+   - `app/tokens/marlo.css` (or `tokens/marlo.css` imported from `app/layout.tsx`) ← cream/ink/lime/slate tokens + `data-surface`.
+   - Logo: inline SVG through `<Logo variant="mark" \| "wordmark" />` using the handoff SVGs (`currentColor`, `color: var(--logo)`, no tile/background). Mark + wordmark files may live next to the component or under `src`/`app` paths that match Next conventions.
+   - Import tokens + Google Fonts (Outfit display, Manrope text, `display=swap`) in `app/layout.tsx`. **Do not add Tailwind** unless CSS tokens cannot match the brand this slice; CSS tokens alone are the default.
+2. **Demo seed** so Production is not an empty in-memory store:
+   - `lib/demo/seed.ts` — `DEMO_HOST_SLUG = "demo"`, `DEMO_EVENT_SLUG = "intro-30"`. `ensureDemoFixtures()` creates (if missing) a weekly schedule (all weekdays 09:00–20:00 UTC so the demo stays bookable after 2026-09-20) and a 1:1 event type `intro-30` / “Intro call” / 30 min / `host-1`.
+   - Call `ensureDemoFixtures()` from public booking page load and from the existing available-times GET + bookings POST (no-op if the slug already exists — tests that `resetEventTypes()` then seed their own `intro-30` stay valid).
+   - Document `/demo/intro-30` in README.
+3. **Routes (App Router)** — prefer handoff `(public)` group; must not break `/`, `/api/*`, `/host`, `/signin`:
+   - `app/(public)/[slug]/[event]/page.tsx` — public booking (step 1 date/slot + step 2 name/email). URL `/demo/intro-30`. The `[event]` param is the **existing event-type slug**. `[slug]` is host/workspace chrome only (`demo`); it is not a new backend resource.
+   - `app/(public)/b/[token]/page.tsx` — confirmation shell. Static `b` wins over `[slug]` for `/b/{token}`.
+   - `app/page.tsx` — replace placeholder-only copy with branded cream/ink/lime landing (Logo + tokens + link to `/demo/intro-30`). Keep visible “Marlo Scheduling” so existing title assertions can be updated, not orphaned.
+4. **`lib/api/` is the only module that knows the backend** (handoff §3 / §7):
+   - Typed helpers: `getSlots({ slug, timeMin, timeMax })`, `createBooking({ slug, start, invitee: { name, email } })`, `getBooking(token)` (token = existing booking `id`).
+   - UI-facing types may mirror handoff (`days` / `token` / `slot_unavailable` code) **or** a thin mapped shape — either is fine if adapters are the only place that know repo JSON.
+   - Repo truths (do not invent `/public/...` routes):
+     - `GET /api/event-types/:slug/available-times?timeMin&timeMax` → `{ times: string[] }` (group: `{ times: { start, spots_remaining }[] }`).
+     - `POST /api/event-types/:slug/bookings` `{ start, invitee: { name, email } }` → 201 `{ booking }` (`id`, `start`, `end`, `status`, `invitee`) or 409 `{ error: "slot_unavailable" \| "session_full" }`.
+   - **Thin adapter allowed:** `GET /api/bookings/[id]/route.ts` returning `getBooking(id)` so the confirmation page can load a token without changing create/reschedule/cancel semantics. If the in-memory row is missing (serverless), the confirmation **page still renders** the branded shell for that token (AC-5 is render, not persistence).
+   - `lib/api/DIVERGENCES.md` logs every handoff vs repo path/shape diff.
+   - Server helpers may call existing `lib/booking` / `lib/availability` functions or the route handlers. Client helpers may `fetch` the existing `/api/...` paths. **`app/**` components/pages never call `fetch`.**
+5. **Booking UI (handoff 6.1–6.2 spirit, time-boxed):**
+   - Cream page, wordmark header, white card, host/event meta, month/date picker of days that have slots, slot list, name + email fields, primary CTA using `details.submit` (“Lock it in”).
+   - Slots from `getSlots` over a month window; group `times` by local date. Keyboard-focusable controls (no axe gate).
+   - On 201: navigate to `/b/{booking.id}` (map `id` → token in the adapter).
+   - On 409 `slot_unavailable`: show `details.errors.slotTaken` from copy; refresh slots.
+   - No hard-coded user-facing English in page/component files — keys from `copy/en.json`.
+6. **Confirmation UI (handoff 6.3 spirit, can be a minimal shell):** lime/`data-surface="lime"` panel, Logo, headline from `confirmation.headline`, subhead from `confirmation.subhead` (substitute host/email when the booking row exists). Page file must not contain the string `Handled.`
+7. **Tests** (`tsx --test`, same runner). Add files and append them to `package.json` `test:unit`:
+   - `tests/api-client.test.ts` — `getSlots` / `createBooking` map to existing handlers; 201 + 409 `slot_unavailable`; DIVERGENCES.md exists and mentions `/public/` vs `/api/event-types`.
+   - `tests/booking-page.test.tsx` — booking page renders branded chrome + copy keys; submitting via the helper creates a booking; source of `app/**/*.tsx` has no `fetch(`.
+   - `tests/confirmation.test.tsx` — `/b/{token}` markup includes `copy.confirmation.headline` and the page module source has no `Handled.`
+   - Update `tests/app.test.tsx`: homepage is branded (tokens and/or Logo) and links to `/demo/intro-30`; drop the “placeholder copy” assertion.
+   - Update `tests/host.test.tsx` public-path list to include `/demo/intro-30` and `/b/` as public.
+   - Update README (`GET /` is branded + demo path). Keep env-name assertions. Do not change `PROOF_CMD`. Do not edit `.github/`.
+8. Auth: booking + confirmation + demo homepage stay public. If an AC cannot be observed without live Google/Neon, report it as impossible rather than adding a manual AC.
 
 ## Assumptions and risks
 
-- Phase 0 locks **D-01..D-05** (v1 packet APPROVED 19 Sep 2026, VP Product + Shahar go). Stack remains Next/Vercel/Neon/Inngest; this slice does not reopen those decisions or add a real DB. Event types and bookings stay stubs.
-- Founder go continuous after GRP (19 Sep 2026 ET): this PLAN is the next dispatched work order, not a product-reopen. It supersedes `1422ff4` / PR #17’s completed GRP PLAN.
-- Existing schedules, 1:1 / group event types, `listAvailableTimes`, booking lock, `CalendarProvider`, and `createFixtureCalendarProvider` remain the source of truth for “is this start inside weekly hours?” (`lib/availability/*`, `lib/booking/*`, `lib/calendar/*`). Collective adds a multi-host busy union on top.
-- Spec AC-06 spirit = one assigned host busy (calendar **or** confirmed booking, including partial overlap) hides the start for everyone; both-free shows it; concurrent double-book of the same collective start is one winner. Tests must use distinct per-host busy and overlap in flight.
-- Risk: querying only the organizer’s `primary` calendar would make every host look identically busy — AC-2/AC-4 fail unless each host’s `calendarId` is resolved and `freeBusy`’d.
-- Risk: `listConfirmedBookingsForHost` matching only `booking.hostId` would leave co-hosts bookable after a collective confirm — occupy via `hostIds`.
-- Risk: locking only the organizer’s `(hostId, start)` would let a 1:1 on a co-host race the collective — lock every assigned host.
-- Risk: leaving the superseded “reject collective kind” tests in place would make a correct implementation fail `npm test` — those assertions must be retired in this slice (`round_robin` remains rejected).
-- Risk: returning group `{ start, spots_remaining }` for a collective slug would break the 1:1-shaped GET contract — collective uses `{ times: string[] }`.
-- Risk: a live Google write would fail `proof` — keep fixture/mock providers.
-- Risk: adding round robin, managed events, or payments would violate non-goals.
+- Phase 0 locks **D-01..D-05** (v1 packet APPROVED 19 Sep 2026). Stack remains Next/Vercel/in-memory stubs. This slice does not add a real DB or live calendar.
+- Founder + VP Product GO 20 Sep 2026 ET: this PLAN is the next dispatched work order, not a product-reopen. It supersedes `f67bafc` / PR #20’s completed COL PLAN.
+- FE handoff v1 (2026-09-20) is the brand/UI source of truth. Handoff §7 `/public/event_types/.../slots` and `/public/bookings` **are not implemented in this repo**. Existing routes in `app/api/event-types/[slug]/available-times` and `.../bookings` plus `lib/booking/booking.ts` are the contract. Adapters absorb the mismatch.
+- Booking `id` is the confirmation token. Do not add a second token column this slice.
+- In-memory event types/bookings do not persist across Vercel isolates. Seed-on-request makes the **demo event type** visible; a confirmation page must still render if `getBooking(token)` is null.
+- Risk: putting booking at `app/[slug]/[event]` without a static `app/b/[token]` would steal `/b/{token}` — use the static `b` segment.
+- Risk: seeding `intro-30` inside `resetEventTypes()` would break tests that expect an empty store — seed only via `ensureDemoFixtures()` when the slug is missing.
+- Risk: calling `fetch` from a component would violate AC-3 — keep it in `lib/api`.
+- Risk: a hard-coded `"Handled."` in the confirmation page file fails AC-5 even if the rendered text is correct.
+- Risk: adding Tailwind/Zod/TanStack/Playwright would violate non-goals unless strictly required (it is not).
+- Risk: changing POST body semantics or 409 codes would break existing BOOK-core tests — adapt in `lib/api` only.
+- Risk: leaving the homepage “Placeholder — the first scheduling slice is on the way.” as the only public UX fails AC-2.
 
 ## Verification
 
@@ -70,7 +97,7 @@ BUILDER: claude — extending the in-memory event-type stub + multi-host freeBus
 PROOF_CMD: npm test
 ```
 
-`PROOF_CMD` remains exactly `npm test`. Green (exit code 0) means typecheck + `next build` + unit tests all pass, including AC-1..5 and the existing OAuth/availability/BOOK-core/BOOK-lifecycle/notification/OFF/WH/GRP/scaffold checks (home placeholder, `/api/health`, Auth.js Google provider, host redirect, calendar stub, freeBusy + create/patch/delete fixture, schedule/event-type stubs, slot engine, available-times GET, booking create/reschedule/cancel + 409 race, notificationMode + EmailProvider mock + notification_log, one-off windows + single-use 410, webhook HMAC + lifecycle emit + retry stub, group capacity + last-spot `session_full`, README env names). No manual or visual checks for this slice. No live Gmail. No live Google. No live internet HTTP.
+`PROOF_CMD` remains exactly `npm test`. Green (exit code 0) means typecheck + `next build` + unit tests all pass, including AC-2..6 and the existing OAuth/availability/BOOK-core/BOOK-lifecycle/notification/OFF/WH/GRP/COL/scaffold checks (branded home + demo link, `/api/health`, Auth.js Google provider, host redirect, calendar stub, freeBusy + create/patch/delete fixture, schedule/event-type stubs, slot engine, available-times GET, booking create/reschedule/cancel + 409 race, notificationMode + EmailProvider mock + notification_log, one-off windows + single-use 410, webhook HMAC + lifecycle emit + retry stub, group capacity + last-spot `session_full`, collective intersection + all-hosts booking, README env names + demo path). No live Gmail. No live Google. No live internet HTTP. No axe/Lighthouse/Playwright gate this slice.
 
 ## Round budget
 
