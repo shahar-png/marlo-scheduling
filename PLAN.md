@@ -107,7 +107,7 @@ Work proceeds in the order below; each step lands with its tests so `npm test` i
 
 ## Verification
 
-`PROOF_CMD: npm test`
+PROOF_CMD: npm test
 
 `npm test` runs `scripts/proof.cjs` → typecheck → `next build` (with the explicit disabled env from AC-6) → unit/route tests. It must pass with no `DATABASE_URL`, no Google credentials, and no network (the test fetch guard enforces this). All AC-1..16 proofs are inside this run.
 
