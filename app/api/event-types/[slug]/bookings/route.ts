@@ -10,6 +10,7 @@ import {
   setBookingCalendarProvider,
 } from '@/lib/booking/calendar-runtime';
 import { getHostCalendarConnection } from '@/lib/calendar/connection';
+import { DEMO_EVENT_SLUG, ensureDemoFixtures } from '@/lib/demo/seed';
 
 export { setBookingCalendarProvider };
 
@@ -44,6 +45,11 @@ export async function POST(
       { error: 'start and invitee name/email are required' },
       { status: 400 },
     );
+  }
+
+  // Demo seed (no-op when the slug already exists; other slugs untouched).
+  if (slug === DEMO_EVENT_SLUG) {
+    ensureDemoFixtures();
   }
 
   const eventType = getEventTypeBySlug(slug);
