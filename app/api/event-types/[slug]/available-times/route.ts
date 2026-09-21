@@ -16,6 +16,7 @@ import {
   hostBookingsAsBusy,
   withSpotsRemaining,
 } from '@/lib/booking/booking';
+import { DEMO_EVENT_SLUG, ensureDemoFixtures } from '@/lib/demo/seed';
 import fixture from '@/tests/fixtures/google-freebusy.json';
 
 let injectedProvider: CalendarProvider | null = null;
@@ -47,6 +48,11 @@ export async function GET(
       { error: 'timeMin and timeMax are required' },
       { status: 400 },
     );
+  }
+
+  // Demo seed (no-op when the slug already exists; other slugs untouched).
+  if (slug === DEMO_EVENT_SLUG) {
+    ensureDemoFixtures();
   }
 
   const eventType = getEventTypeBySlug(slug);
