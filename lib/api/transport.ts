@@ -6,6 +6,13 @@ export type ApiRequest = {
   method: 'GET' | 'POST';
   path: string;
   body?: unknown;
+  /**
+   * Extra request headers. Two exist in this slice: the C9 `Idempotency-Key` on
+   * create, and the C11 `Authorization: Bearer {token}` on every
+   * `/api/bookings/{id}/*` call. The token is never sent in the query string or
+   * the JSON body.
+   */
+  headers?: Record<string, string>;
 };
 
 export type ApiResponse = {
@@ -18,10 +25,11 @@ export type Transport = (request: ApiRequest) => Promise<ApiResponse>;
 export const fetchTransport: Transport = async (request) => {
   const response = await fetch(request.path, {
     method: request.method,
-    headers:
-      request.body === undefined
-        ? { accept: 'application/json' }
-        : { accept: 'application/json', 'content-type': 'application/json' },
+    headers: {
+      accept: 'application/json',
+      ...(request.body === undefined ? {} : { 'content-type': 'application/json' }),
+      ...(request.headers ?? {}),
+    },
     body: request.body === undefined ? undefined : JSON.stringify(request.body),
     cache: 'no-store',
   });

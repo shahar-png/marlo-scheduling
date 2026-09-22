@@ -1,4 +1,8 @@
-import { getEventTypeBySlug } from '@/lib/availability/event-type';
+import {
+  DEMO_OWNER_ID,
+  ownersOfSlug,
+  resolveEventType,
+} from '@/lib/availability/event-type';
 import {
   bookAvailableSlot,
   BookingConflictError,
@@ -13,6 +17,15 @@ import { getHostCalendarConnection } from '@/lib/calendar/connection';
 import { DEMO_EVENT_SLUG, ensureDemoFixtures } from '@/lib/demo/seed';
 
 export { setBookingCalendarProvider };
+
+// C2 — the legacy create. Kept for fixtures/tests and not linked from any page.
+// `slug` resolves **only** within the `demo` owner; a slug owned by someone else
+// is 404 `owner_required`.
+//
+// The C6.9 kinds (`group`, `collective`) keep their existing memory-mode fixture
+// path here with no key, no fingerprint, and no C9 record — the exemption that
+// keeps `tests/group-route.test.ts` and `tests/collective-route.test.ts` passing
+// byte-for-byte unmodified (REV15-03).
 
 type BookingBody = {
   start?: unknown;
@@ -52,8 +65,12 @@ export async function POST(
     ensureDemoFixtures();
   }
 
-  const eventType = getEventTypeBySlug(slug);
+  const eventType = resolveEventType(DEMO_OWNER_ID, slug);
   if (!eventType) {
+    const owners = ownersOfSlug(slug);
+    if (owners.length > 0 && !owners.includes(DEMO_OWNER_ID)) {
+      return Response.json({ error: 'owner_required' }, { status: 404 });
+    }
     return Response.json({ error: 'event type not found' }, { status: 404 });
   }
 

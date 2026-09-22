@@ -4,9 +4,11 @@ import type { CalendarProvider } from '@/lib/calendar/provider';
 import type { GoogleFreeBusyFixture } from '@/lib/calendar/google-freebusy';
 import {
   COLLECTIVE,
+  DEMO_OWNER_ID,
   eventTypeHostIds,
-  getEventTypeBySlug,
   GROUP,
+  ownersOfSlug,
+  resolveEventType,
 } from '@/lib/availability/event-type';
 import { getAvailabilitySchedule } from '@/lib/availability/schedule';
 import { listAvailableTimes } from '@/lib/availability/slots';
@@ -55,8 +57,14 @@ export async function GET(
     ensureDemoFixtures();
   }
 
-  const eventType = getEventTypeBySlug(slug);
+  // C2: resolved **only** within the `demo` owner; a slug owned by someone else
+  // is 404 `owner_required`.
+  const eventType = resolveEventType(DEMO_OWNER_ID, slug);
   if (!eventType) {
+    const owners = ownersOfSlug(slug);
+    if (owners.length > 0 && !owners.includes(DEMO_OWNER_ID)) {
+      return Response.json({ error: 'owner_required' }, { status: 404 });
+    }
     return Response.json({ error: 'event type not found' }, { status: 404 });
   }
 

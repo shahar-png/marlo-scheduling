@@ -1,6 +1,7 @@
 import {
   CALENDAR_INVITATION,
   COLLECTIVE,
+  DEMO_OWNER_ID,
   EMAIL_CONFIRMATION,
   eventTypeHostIds,
   getEventType,
@@ -593,6 +594,8 @@ function resolveSingleUseTarget(token: string): {
 function eventTypeFromOneOff(meeting: OneOffMeeting): EventType {
   return {
     id: meeting.id,
+    // One-off meetings are demo-owner fixtures (C10: never durable records).
+    ownerId: DEMO_OWNER_ID,
     hostId: meeting.hostId,
     slug: `one-off-${meeting.id}`,
     name: meeting.name,

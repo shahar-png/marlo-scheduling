@@ -11,8 +11,14 @@ import {
   setBookingCalendarProvider,
 } from '@/lib/booking/calendar-runtime';
 import { getHostCalendarConnection } from '@/lib/calendar/connection';
+import { resolveEnv } from '@/lib/env';
 
 export { setBookingCalendarProvider };
+
+// C10 — links and one-off meetings are not durable records. In pg/live mode
+// both link routes return 501 `links_not_supported` as the **first** statement
+// of the handler: before the link lookup, any store query, calendar call, or
+// email (AC-22). In memory mode they stay fixture-only.
 
 type BookingBody = {
   start?: unknown;
@@ -26,6 +32,10 @@ export async function POST(
   request: Request,
   context: { params: Promise<{ token: string }> },
 ) {
+  if (resolveEnv().store === 'pg') {
+    return Response.json({ error: 'links_not_supported' }, { status: 501 });
+  }
+
   const { token } = await context.params;
 
   let body: BookingBody;

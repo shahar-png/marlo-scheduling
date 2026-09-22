@@ -21,7 +21,44 @@ export type ListAvailableTimesInput = {
   calendarId: string;
   calendarIds?: string[];
   extraBusy?: BusyWindow[];
+  /**
+   * Candidate-start step (REV3-08). The public / owner-scoped / legacy routes
+   * and the create route keep `incrementMinutes = durationMinutes` (BOOK-FE
+   * behaviour unchanged); only the **authenticated reschedule** policy uses
+   * `RESCHEDULE_SLOT_INCREMENT_MIN`, which is what makes an overlapping move
+   * (09:00 → 09:15 for a 30-minute booking) actually generated rather than
+   * merely un-blocked.
+   */
+  incrementMinutes?: number;
 };
+
+/** C12 — the authenticated reschedule grid, independent of the duration. */
+export const RESCHEDULE_SLOT_INCREMENT_MIN = 15;
+
+export function rescheduleIncrementFor(durationMinutes: number): number {
+  return Math.min(RESCHEDULE_SLOT_INCREMENT_MIN, durationMinutes);
+}
+
+export type RescheduleCandidatesInput = Omit<ListAvailableTimesInput, 'incrementMinutes'> & {
+  /** The booking's current start is never offered (an unchanged-time move). */
+  excludeStart: string;
+};
+
+/**
+ * The single generator behind `GET /api/bookings/{id}/available-times` **and**
+ * the reschedule mutation's validation, so every offered slot is accepted and
+ * nothing else is (C12 / C6.6).
+ */
+export async function rescheduleCandidates(
+  input: RescheduleCandidatesInput,
+): Promise<string[]> {
+  const times = await listAvailableTimes({
+    ...input,
+    incrementMinutes: rescheduleIncrementFor(input.eventType.durationMinutes),
+  });
+  const excluded = new Date(Date.parse(input.excludeStart)).toISOString();
+  return times.filter((start) => start !== excluded);
+}
 
 export async function listAvailableTimes(
   input: ListAvailableTimesInput,
@@ -49,6 +86,10 @@ export async function listAvailableTimes(
   const busy = [...calendarBusy, ...(input.extraBusy ?? [])];
 
   const durationMs = input.eventType.durationMinutes * 60_000;
+  const incrementMs = (input.incrementMinutes ?? input.eventType.durationMinutes) * 60_000;
+  if (incrementMs <= 0) {
+    throw new Error('incrementMinutes must be a positive integer');
+  }
   const times: string[] = [];
 
   const windows = input.oneOffMeeting
@@ -63,7 +104,7 @@ export async function listAvailableTimes(
     for (
       let start = window.startMs;
       start + durationMs <= window.endMs;
-      start += durationMs
+      start += incrementMs
     ) {
       const end = start + durationMs;
       if (start < timeMin || end > timeMax) {

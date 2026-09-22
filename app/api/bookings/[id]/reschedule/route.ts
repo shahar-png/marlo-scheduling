@@ -4,46 +4,76 @@ import {
   BookingNotFoundError,
   BookingValidationError,
   getBooking,
-  rescheduleBooking,
+  rescheduleBooking as rescheduleLegacyBooking,
 } from '@/lib/booking/booking';
 import { getBookingCalendarProvider } from '@/lib/booking/calendar-runtime';
 import { getHostCalendarConnection } from '@/lib/calendar/connection';
+import { rescheduleBooking } from '@/lib/booking/service';
+import { authorizedScope, resolveBookingId } from '@/lib/api/booking-routes';
+import { errorResponse, originOf, readJsonBody } from '@/lib/api/route-helpers';
 
-type RescheduleBody = {
-  start?: unknown;
-};
+// C2 / C6.6 — `POST /api/bookings/{id}/reschedule`, token-authenticated, body
+// `{ start, expectedRevision }`; a revision mismatch is 409 `booking_changed`.
+//
+// A legacy in-memory fixture row keeps its existing handler (outside the C6
+// contract, C6.9/C10).
+
+export const dynamic = 'force-dynamic';
+
+type Body = { start?: unknown; expectedRevision?: unknown };
 
 export async function POST(
   request: Request,
   context: { params: Promise<{ id: string }> },
 ) {
   const { id } = await context.params;
-
-  let body: RescheduleBody;
-  try {
-    body = (await request.json()) as RescheduleBody;
-  } catch {
+  const body = await readJsonBody<Body>(request);
+  if (body === null) {
     return Response.json({ error: 'invalid json body' }, { status: 400 });
   }
-
   const start = typeof body.start === 'string' ? body.start : '';
   if (!start) {
     return Response.json({ error: 'start is required' }, { status: 400 });
   }
 
+  const resolved = await resolveBookingId(id);
+  if (resolved.kind === 'durable') {
+    if (
+      typeof body.expectedRevision !== 'number' ||
+      !Number.isInteger(body.expectedRevision)
+    ) {
+      return Response.json({ error: 'expectedRevision is required' }, { status: 400 });
+    }
+    try {
+      const scope = await authorizedScope(request, resolved.row);
+      const outcome = await rescheduleBooking(scope, {
+        start,
+        expectedRevision: body.expectedRevision,
+        origin: originOf(request),
+      });
+      return Response.json(outcome.envelope, { status: 200 });
+    } catch (error) {
+      const mapped = errorResponse(error);
+      if (mapped !== null) {
+        return mapped;
+      }
+      throw error;
+    }
+  }
+
+  return legacyReschedule(id, start);
+}
+
+async function legacyReschedule(id: string, start: string): Promise<Response> {
   const existing = getBooking(id);
   if (!existing) {
     return Response.json({ error: 'booking not found' }, { status: 404 });
   }
-
   const eventType = getEventType(existing.eventTypeId);
-  const connection = eventType
-    ? getHostCalendarConnection(eventType.hostId)
-    : null;
+  const connection = eventType ? getHostCalendarConnection(eventType.hostId) : null;
   const calendarId = connection?.destinationCalendarId ?? 'primary';
-
   try {
-    const booking = await rescheduleBooking({
+    const booking = await rescheduleLegacyBooking({
       bookingId: id,
       start,
       provider: getBookingCalendarProvider(),

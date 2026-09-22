@@ -12,13 +12,38 @@ export type SlotsResult = {
   times: Slot[];
 };
 
+// C3 / C11: `id` and `token` are two different things. The id is the API path
+// segment; the token is the `/b/{token}` capability and the bearer credential.
+export type DeliveryEmailState = 'sent' | 'failed' | 'pending';
+export type DeliveryCalendarState =
+  | 'created'
+  | 'failed'
+  | 'skipped'
+  | 'deleted'
+  // REV13-02: `pending` mirrors `calendar_state='pending'` and is returned only
+  // by the read surfaces; it renders as a status line with no control.
+  | 'pending';
+
+export type BookingDelivery = {
+  email: DeliveryEmailState;
+  calendar: DeliveryCalendarState;
+  errors?: { email?: string; calendar?: string };
+};
+
 export type PublicBooking = {
+  /** The API path segment. Absent on legacy fixture rows, where id === token. */
+  id: string;
   token: string;
   start: string;
   end: string;
   status: string;
   eventTypeId: string;
   invitee: { name: string; email: string };
+  ownerSlug?: string;
+  eventSlug?: string;
+  revision?: number;
+  hostFirstName?: string;
+  delivery?: BookingDelivery;
 };
 
 // Confirmation adapter result (BOOK-FE-15/17/19/20): a discriminated union.
@@ -72,7 +97,22 @@ export type CreateBookingInput = {
   start: string;
   invitee: { name: string; email: string };
   now?: Clock;
+  /** C1: present for the owner-scoped route; absent for the legacy one. */
+  ownerSlug?: string;
+  /** C9: the client owns the key and the payload it was minted for. */
+  idempotencyKey?: string;
+  notes?: string;
 };
+
+/** C9 non-terminal create codes — the client retains its record and replays. */
+export const OPERATION_IN_PROGRESS = 'operation_in_progress' as const;
+export const OPERATION_SUPERSEDED = 'operation_superseded' as const;
+export const BOOKING_OUTCOME_UNKNOWN = 'booking_outcome_unknown' as const;
+export const IDEMPOTENCY_KEY_REUSED = 'idempotency_key_reused' as const;
+export const GROUP_NOT_SUPPORTED = 'group_not_supported' as const;
+export const COLLECTIVE_NOT_SUPPORTED = 'collective_not_supported' as const;
+export const BOOKING_CHANGED = 'booking_changed' as const;
+export const STALE_REVISION = 'stale_revision' as const;
 
 export type BookingApi = {
   getSlots(input: GetSlotsInput): Promise<SlotsResult>;

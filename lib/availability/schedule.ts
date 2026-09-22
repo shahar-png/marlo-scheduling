@@ -15,6 +15,12 @@ export type CreateAvailabilityScheduleInput = {
   hostId: string;
   timezone: string;
   windows: WeekdayWindow[];
+  /**
+   * C1: sign-in materialization and the migration seed pass the deterministic
+   * `sch_{ownerSlug}__{scheduleKey}` id so a fresh isolate reproduces it.
+   * Fixture callers omit it and get a uuid, exactly as before.
+   */
+  id?: string;
 };
 
 const LOCAL_TIME = /^([01]\d|2[0-3]):([0-5]\d)$/;
@@ -45,7 +51,7 @@ export function createAvailabilitySchedule(
   const windows = input.windows.map((window) => normalizeWindow(window));
 
   const schedule: AvailabilitySchedule = {
-    id: crypto.randomUUID(),
+    id: input.id ?? crypto.randomUUID(),
     hostId,
     timezone,
     windows,

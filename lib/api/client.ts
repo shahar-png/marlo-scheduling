@@ -112,22 +112,39 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     if (slugSegment === null) {
       return { ok: false, code: UNKNOWN_ERROR };
     }
-    // Exactly one request per call — no retry loop. The backend has no
-    // idempotency key (DIVERGENCES.md), so a retry could double-book.
+    // Exactly one request per call — no retry loop. Retry safety comes from the
+    // C9 `Idempotency-Key`, which the caller owns together with the payload it
+    // was minted for; the owner-scoped route requires it.
+    const ownerSegment =
+      input.ownerSlug === undefined ? null : encodePathSegment(input.ownerSlug);
+    if (input.ownerSlug !== undefined && ownerSegment === null) {
+      return { ok: false, code: UNKNOWN_ERROR };
+    }
+    const path =
+      ownerSegment === null
+        ? `/api/event-types/${slugSegment}/bookings`
+        : `/api/owners/${ownerSegment}/event-types/${slugSegment}/bookings`;
     const response = await transport({
       method: 'POST',
-      path: `/api/event-types/${slugSegment}/bookings`,
+      path,
       body: {
         start: input.start,
         invitee: { name: input.invitee.name, email: input.invitee.email },
+        ...(input.notes === undefined ? {} : { notes: input.notes }),
       },
+      ...(input.idempotencyKey === undefined
+        ? {}
+        : { headers: { 'idempotency-key': input.idempotencyKey } }),
     });
+    // Only 201 is create success — a committed booking must never reach the
+    // form's failure path (REV8-02).
     if (response.status === 201) {
       const booking = mapBooking(bookingOf(response.body));
       if (!booking) {
         return { ok: false, code: UNKNOWN_ERROR, status: 201 };
       }
-      return { ok: true, booking };
+      const delivery = mapDelivery(response.body);
+      return { ok: true, booking: delivery === undefined ? booking : { ...booking, delivery } };
     }
     if (response.status === 409) {
       const error = errorMessage(response.body);
@@ -171,9 +188,11 @@ export type RepoBooking = {
   invitee: { name: string; email: string };
 };
 
-// Booking `id` is the confirmation token (`/b/{token}`); no second column.
-// `status` and `eventTypeId` are preserved (the confirmation page branches on
-// status; the server adapter resolves `eventTypeId` → `bookAgainHref`).
+// C11 — `token` is mapped from `booking.token`, explicitly and separately from
+// `booking.id`. A legacy fixture row (the retained `/api/event-types/*` and
+// `/api/links/*` paths, which C10/C6.9 keep outside the C6 contract) carries no
+// `token` column; for those, and only those, the id still serves as the token so
+// the fixture surfaces keep working.
 export function mapBooking(booking: unknown): PublicBooking | null {
   if (!isRecord(booking)) {
     return null;
@@ -182,8 +201,10 @@ export function mapBooking(booking: unknown): PublicBooking | null {
   if (typeof booking.id !== 'string' || typeof booking.start !== 'string') {
     return null;
   }
-  return {
-    token: booking.id,
+  const token = typeof booking.token === 'string' ? booking.token : booking.id;
+  const mapped: PublicBooking = {
+    id: booking.id,
+    token,
     start: booking.start,
     end: typeof booking.end === 'string' ? booking.end : '',
     status: typeof booking.status === 'string' ? booking.status : '',
@@ -194,6 +215,47 @@ export function mapBooking(booking: unknown): PublicBooking | null {
       email: typeof invitee.email === 'string' ? invitee.email : '',
     },
   };
+  if (typeof booking.ownerSlug === 'string') {
+    mapped.ownerSlug = booking.ownerSlug;
+  }
+  if (typeof booking.eventSlug === 'string') {
+    mapped.eventSlug = booking.eventSlug;
+  }
+  if (typeof booking.revision === 'number') {
+    mapped.revision = booking.revision;
+  }
+  if (typeof booking.hostFirstName === 'string') {
+    mapped.hostFirstName = booking.hostFirstName;
+  }
+  return mapped;
+}
+
+/** C3 — carries `delivery` through unchanged, `pending` included (REV13-02). */
+export function mapDelivery(body: unknown): BookingDelivery | undefined {
+  if (!isRecord(body) || !isRecord(body.delivery)) {
+    return undefined;
+  }
+  const delivery = body.delivery;
+  const email = delivery.email;
+  const calendar = delivery.calendar;
+  if (typeof email !== 'string' || typeof calendar !== 'string') {
+    return undefined;
+  }
+  const mapped: BookingDelivery = {
+    email: email as BookingDelivery['email'],
+    calendar: calendar as BookingDelivery['calendar'],
+  };
+  if (isRecord(delivery.errors)) {
+    const errors: { email?: string; calendar?: string } = {};
+    if (typeof delivery.errors.email === 'string') {
+      errors.email = delivery.errors.email;
+    }
+    if (typeof delivery.errors.calendar === 'string') {
+      errors.calendar = delivery.errors.calendar;
+    }
+    mapped.errors = errors;
+  }
+  return mapped;
 }
 
 function normalizeTimes(body: unknown): Slot[] {
