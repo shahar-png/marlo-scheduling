@@ -3,6 +3,7 @@
 import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { Logo } from '@/app/components/Logo';
 import { t } from '@/lib/copy';
+import type { ApiClient } from '@/lib/api/client';
 import type { BookingApi, Clock } from '@/lib/api/types';
 import {
   createBookingFormStore,
@@ -66,6 +67,21 @@ const ERROR_COPY_KEY: Record<Exclude<BookingFormError, null>, string> = {
   generic: 'details.errors.generic',
 };
 
+/** `sessionStorage` is unavailable during SSR and in privacy modes. */
+function sessionStorageOrNull() {
+  try {
+    return typeof window === 'undefined' ? null : window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
+function hasRecover(
+  api: BookingApi,
+): api is BookingApi & { recoverBooking: ApiClient['recoverBooking'] } {
+  return typeof (api as { recoverBooking?: unknown }).recoverBooking === 'function';
+}
+
 export function BookingForm(props: BookingFormProps) {
   const storeRef = useRef<BookingFormStore | null>(null);
   if (storeRef.current === null) {
@@ -73,9 +89,16 @@ export function BookingForm(props: BookingFormProps) {
       props.store ??
       createBookingFormStore({
         slug: props.slug,
+        // C1/C9: the record is keyed per owner+event, and the create is sent to
+        // the owner-scoped route. `hostSlug` is the canonical owner the Server
+        // page resolved — never the URL segment.
+        ownerSlug: props.hostSlug,
         durationMinutes: props.eventMeta.durationMinutes,
         timeZone: props.timeZone,
         api: props.api,
+        storage: sessionStorageOrNull(),
+        newKey: () => crypto.randomUUID(),
+        ...(hasRecover(props.api) ? { recover: props.api.recoverBooking } : {}),
         navigate: props.navigate,
         now: props.now,
         schedule: props.schedule,
@@ -87,7 +110,10 @@ export function BookingForm(props: BookingFormProps) {
 
   useEffect(() => {
     if (!store.getState().loaded && !store.getState().loading) {
-      void store.load();
+      // C9: `start()` resolves an unresolved submission **before** it loads
+      // availability. Showing a picker first would invite the guest to book a
+      // second slot while the first one may already have committed.
+      void store.start();
     }
     const stopTimer = store.startExpiryTimer();
     window.addEventListener('focus', store.handleFocus);
@@ -126,6 +152,35 @@ export function BookingForm(props: BookingFormProps) {
       : null;
   const errorCopy = state.error ? t(ERROR_COPY_KEY[state.error]) : null;
 
+  // C9: while an unresolved submission is being replayed the form is hidden —
+  // the booking may already exist, and a visible picker invites a second one.
+  if (state.recovery !== 'idle') {
+    return (
+      <main
+        className="marlo-page"
+        data-booking-page={props.hostSlug}
+        data-recovery={state.recovery}
+      >
+        <header className="marlo-header">
+          <Logo variant="wordmark" height={25} />
+        </header>
+        <section className="marlo-card" style={{ gridTemplateColumns: '1fr' }}>
+          <p>Finishing your booking…</p>
+          {state.recovery === 'stalled' ? (
+            <>
+              <button type="button" onClick={() => void store.retryRecovery()}>
+                Try again
+              </button>
+              <button type="button" onClick={() => void store.discardRecovery()}>
+                Start over
+              </button>
+            </>
+          ) : null}
+        </section>
+      </main>
+    );
+  }
+
   return (
     <main className="marlo-page" data-booking-page={props.hostSlug}>
       <header className="marlo-header">
@@ -134,6 +189,10 @@ export function BookingForm(props: BookingFormProps) {
           {t('booking.timesShownIn', { timezoneLabel: timeZone })}
         </span>
       </header>
+
+      {state.recoveryNotice ? (
+        <p data-recovery-notice="true">Your earlier booking didn&rsquo;t go through.</p>
+      ) : null}
 
       <form
         className="marlo-card"

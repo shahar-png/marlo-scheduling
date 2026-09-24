@@ -30,17 +30,22 @@ import { busyOverlaps, externalBusy } from './occupancy';
 import {
   beginOp,
   bumpVersion,
+  failAttempt,
   finishAttempt,
   newAttempt,
   observeId,
   takeOverOp,
+  unobserved,
+  verifyInsert,
   writeAttempt,
   classifyCalendarError,
   OUTCOME_DEFINITE,
   SupersededError,
   type LifecycleContext,
 } from './ops';
+import { isAbsenceStatus } from '../google/errors';
 import { hasEligibleReap, reapRetiredIds } from './reap';
+import { settleCompletion } from './settle';
 import {
   isStaleOp,
   retainedFrom,
@@ -102,6 +107,57 @@ export async function rescheduleDurableBooking(
   }
 
   const window = intervalFor(request);
+
+  // The existing operation is inspected and reconciled **before** any external
+  // read (REVIEW-03). C6.6(i) recovery of a move that already happened needs no
+  // availability at all, so running R0 first could answer a same-target retry
+  // `slot_unavailable` (an external event now overlaps the target) or
+  // `availability_unknown` (`events.list` is down) for a reschedule that is
+  // already applied at Google and only needs its T2.
+  const inspected = await ctx.store.withHostLock(existing.hostId, async (tx) => {
+    const row = await tx.selectForUpdate(request.bookingId);
+    if (row === null) {
+      return { kind: 'gone' as const };
+    }
+    if (row.status !== 'confirmed' || row.revision !== request.expectedRevision) {
+      return { kind: 'changed' as const, row };
+    }
+    if (row.pendingOp === null) {
+      return { kind: 'clear' as const };
+    }
+    const op = row.pendingOp;
+    if (op.kind === 'cancel' || !isStaleOp(op, ctx.clock.now())) {
+      // A stale cancel is resumed only by a cancel call.
+      return { kind: 'busy' as const, row, op };
+    }
+    const taken = await takeOverOp(tx, row, op, ctx.clock);
+    if (taken === null) {
+      return { kind: 'raced' as const };
+    }
+    return { kind: 'tookOver' as const, row, op: taken };
+  });
+
+  if (inspected.kind === 'gone') {
+    throw new BookingChangedError();
+  }
+  if (inspected.kind === 'changed') {
+    throw new BookingChangedError(bookingBody(inspected.row, deps.meta));
+  }
+  if (inspected.kind === 'raced') {
+    throw new OperationInProgressError(1);
+  }
+  if (inspected.kind === 'busy') {
+    throw new OperationInProgressError(retryAfterSeconds(inspected.op, ctx.clock.now()));
+  }
+  if (inspected.kind === 'tookOver') {
+    const reconciled = await reconcileStale(deps, request, inspected.row, inspected.op);
+    if (reconciled !== null) {
+      return reconciled;
+    }
+    // (iii) proceed as a new op under the caller's expectedRevision — and only
+    // now does the new move need availability.
+    return rescheduleDurableBooking(deps, request, pass + 1);
+  }
 
   // R0 — external read BEFORE T1, outside any transaction (REV6-03), with the
   // booking's own managed event excluded.
@@ -251,13 +307,36 @@ async function reconcileStale(
       ? { state: 'absent' as const }
       : await observeId(ctx, row.id, op.fallbackEventId);
 
-  if (observedOld.state === 'ambiguous' || observedFallback.state === 'ambiguous') {
+  if (unobserved(observedOld) || unobserved(observedFallback)) {
+    // Neither completion nor abandonment is permitted on a read that
+    // established nothing (C6.0): the op stays owned.
     throw new BookingOutcomeUnknownError();
+  }
+
+  // C6.3c — the bump covers **every** intended event this takeover found, not
+  // just `oldEventId`. A predecessor that fallback-inserted F and then paused
+  // before its compensating delete still holds F's insert etag; adopting F
+  // without invalidating that version lets the delayed delete land on the event
+  // this takeover is about to make the booking's own (LIVE-REVIEW-04).
+  let fallbackEtag: string | null =
+    observedFallback.state === 'present' ? observedFallback.event.etag : null;
+  let fallbackInserted = observedFallback.state === 'present';
+  if (fallbackInserted && op.fallbackEventId !== undefined) {
+    const bumpedFallback = await bumpVersion(ctx, row, op, op.fallbackEventId);
+    if (bumpedFallback.state === 'ambiguous') {
+      throw new BookingOutcomeUnknownError();
+    }
+    if (bumpedFallback.state === 'absent') {
+      // It went away between the two reads; nothing was achieved through it.
+      fallbackInserted = false;
+      fallbackEtag = null;
+    } else {
+      fallbackEtag = bumpedFallback.etag;
+    }
   }
 
   const movedToTarget =
     observedOld.state === 'present' && observedOld.event.start === op.newStart;
-  const fallbackInserted = observedFallback.state === 'present';
 
   if (movedToTarget || fallbackInserted) {
     // The predecessor achieved its move: complete it through its own T2.
@@ -265,7 +344,7 @@ async function reconcileStale(
       ? (op.fallbackEventId as string)
       : (targetId as string);
     const etag = fallbackInserted
-      ? (observedFallback.state === 'present' ? observedFallback.event.etag : null)
+      ? fallbackEtag
       : observedOld.state === 'present'
         ? observedOld.event.etag
         : null;
@@ -305,8 +384,25 @@ async function runRescheduleCalendarStep(
   let etag: string | null = null;
   let ownInsert: { eventId: string; attemptId: string; etag: string } | null = null;
 
-  if (oldEventId !== undefined && op.etag !== undefined) {
-    const attempt = newAttempt('patch', oldEventId, op.gen, ctx.clock, op.etag);
+  // C6.3c: when the row carries an event id but no etag (a row created before
+  // the column, or one whose create left `calendar_state='failed'` while an
+  // ambiguous insert could still land), the op **observes** the id and records
+  // the etag before mutating. Falling straight through to `insertFallback`
+  // duplicates an event that is actually there (REVIEW-04).
+  let patchEtag = op.etag;
+  if (oldEventId !== undefined && patchEtag === undefined) {
+    const observed = await observeId(ctx, row.id, oldEventId);
+    if (unobserved(observed)) {
+      // A refused or ambiguous read is not absence: the op stays owned.
+      throw new BookingOutcomeUnknownError();
+    }
+    if (observed.state === 'present') {
+      patchEtag = observed.event.etag;
+    }
+  }
+
+  if (oldEventId !== undefined && patchEtag !== undefined) {
+    const attempt = newAttempt('patch', oldEventId, op.gen, ctx.clock, patchEtag);
     if (!(await writeAttempt(ctx, row, op, attempt))) {
       return supersededReschedule(deps, request, row, op, null);
     }
@@ -317,7 +413,7 @@ async function runRescheduleCalendarStep(
         start: op.newStart,
         end: op.newEnd,
         summary: request.eventName,
-        ifMatch: op.etag,
+        ifMatch: patchEtag,
         sendUpdates: ctx.sendUpdates,
       });
       await finishAttempt(ctx, row, op, attempt.attemptId, 'applied');
@@ -334,6 +430,14 @@ async function runRescheduleCalendarStep(
         }
         resultingId = oldEventId;
         etag = reconciled;
+      } else if (klass === OUTCOME_DEFINITE && !isAbsenceStatus(error)) {
+        // A definite refusal that is NOT 404/410 (401, 403, 400, 422,
+        // `host_not_connected`) says the patch did nothing — it does **not**
+        // say the event is gone. Inserting a fallback here would duplicate a
+        // live event, so the reschedule fails and the booking is untouched.
+        await finishAttempt(ctx, row, op, attempt.attemptId, 'rejected');
+        await failReschedule(deps, row, op);
+        throw new CalendarPatchFailedError();
       } else if (klass === OUTCOME_DEFINITE) {
         await finishAttempt(ctx, row, op, attempt.attemptId, 'rejected');
         // 404/410 on patch → insert the replacement under the durable fallback id.
@@ -370,7 +474,11 @@ async function runRescheduleCalendarStep(
   await deps.hooks?.afterPatch?.();
   await deps.hooks?.beforeT2?.();
 
-  const completed = await completeReschedule(deps, row, op, resultingId, etag);
+  const completed = await completeReschedule(deps, row, op, resultingId, etag, {
+    resultingId,
+    etag,
+    ownInsert,
+  });
   if (completed.superseded) {
     return supersededReschedule(deps, request, row, op, ownInsert);
   }
@@ -415,15 +523,27 @@ async function insertFallback(
           }
         : {}),
     });
+    const verified = await verifyInsert(ctx, row.id, eventId, event);
+    if (verified.state !== 'present') {
+      // An unverifiable 2xx completes nothing (C6.2, REVIEW-05): the attempt
+      // stays unresolved and the op is retained.
+      throw new BookingOutcomeUnknownError();
+    }
     await finishAttempt(ctx, row, op, attempt.attemptId, 'applied');
-    return { eventId, attemptId: attempt.attemptId, etag: event.etag };
+    return { eventId, attemptId: attempt.attemptId, etag: verified.event.etag };
   } catch (error) {
+    if (error instanceof BookingOutcomeUnknownError) {
+      throw error;
+    }
     const klass = classifyCalendarError(error);
     if (klass === 'already_exists') {
       await finishAttempt(ctx, row, op, attempt.attemptId, 'rejected');
       const observed = await observeId(ctx, row.id, eventId);
       if (observed.state === 'present') {
         return { eventId, attemptId: attempt.attemptId, etag: observed.event.etag };
+      }
+      if (unobserved(observed)) {
+        throw new BookingOutcomeUnknownError();
       }
       return null;
     }
@@ -445,7 +565,7 @@ async function reconcilePrecondition(
 ): Promise<string | null> {
   const { ctx } = deps;
   const observed = await observeId(ctx, row.id, eventId);
-  if (observed.state === 'ambiguous') {
+  if (unobserved(observed)) {
     throw new BookingOutcomeUnknownError();
   }
   if (observed.state === 'absent') {
@@ -492,6 +612,109 @@ async function completeReschedule(
   op: PendingOp,
   resultingId: string | null,
   etag: string | null,
+  /** What this worker changed at Google, for the compensation C6.6 owes. */
+  applied?: { resultingId: string | null; etag: string | null; ownInsert: OwnInsert | null },
+): Promise<{ superseded: boolean; row: BookingRow }> {
+  const { ctx } = deps;
+  const settled = await settleCompletion(
+    ctx,
+    row,
+    () => completeRescheduleTx(deps, row, op, resultingId, etag),
+    // The move committed iff the revision advanced past the one T2 conditioned
+    // on and the row now sits at this op's target.
+    (fresh) =>
+      fresh !== null && fresh.start === op.newStart && fresh.revision > row.revision,
+  );
+  if (settled.kind === 'reconciled') {
+    return { superseded: false, row: settled.row };
+  }
+  if (settled.kind === 'failed') {
+    // The transaction is known to have rolled back: Google is at the new time
+    // and the row at the old one, so this worker undoes its own mutation —
+    // ownership-checked and ETag-conditioned (C6.6).
+    if (applied !== undefined) {
+      await compensateReschedule(deps, row, op, applied);
+    }
+    throw new RescheduleFailedError();
+  }
+  return settled.value;
+}
+
+type OwnInsert = { eventId: string; attemptId: string; etag: string };
+
+/**
+ * C6.6 compensation after a **definite** T2 failure: patch the event back to
+ * the old time with the etag this worker's own patch returned, or delete the
+ * fallback it inserted with the etag that insert returned. Both are preceded by
+ * an attempt write that re-verifies ownership, and a 412 means a takeover has
+ * already invalidated this worker's version — zero further mutations (C6.3c).
+ */
+async function compensateReschedule(
+  deps: RescheduleDeps,
+  row: BookingRow,
+  op: PendingOp,
+  applied: { resultingId: string | null; etag: string | null; ownInsert: OwnInsert | null },
+): Promise<void> {
+  const { ctx } = deps;
+
+  if (applied.ownInsert !== null) {
+    const attempt = newAttempt(
+      'delete',
+      applied.ownInsert.eventId,
+      op.gen,
+      ctx.clock,
+      applied.ownInsert.etag,
+    );
+    if (!(await writeAttempt(ctx, row, op, attempt))) {
+      return; // superseded: the winner owns the event now.
+    }
+    try {
+      await ctx.calendar.remove({
+        calendarId: ctx.calendarId,
+        eventId: applied.ownInsert.eventId,
+        ifMatch: applied.ownInsert.etag,
+        sendUpdates: 'none',
+      });
+      await finishAttempt(ctx, row, op, attempt.attemptId, 'applied');
+    } catch (error) {
+      // 412 or a definite refusal resolves this attempt; a 429/5xx/timeout
+      // leaves it `unresolved`, because the delete may still execute and the id
+      // must stay reapable (C6.0/C6.3b — LIVE-REVIEW-05).
+      await failAttempt(ctx, row, op, attempt.attemptId, error);
+    }
+    return;
+  }
+
+  const eventId = applied.resultingId;
+  if (eventId === null || applied.etag === null || op.oldEventId !== eventId) {
+    return;
+  }
+  const attempt = newAttempt('patch', eventId, op.gen, ctx.clock, applied.etag);
+  if (!(await writeAttempt(ctx, row, op, attempt))) {
+    return;
+  }
+  try {
+    await ctx.calendar.patch({
+      calendarId: ctx.calendarId,
+      eventId,
+      start: row.start,
+      end: row.end,
+      ifMatch: applied.etag,
+      sendUpdates: 'none',
+    });
+    await finishAttempt(ctx, row, op, attempt.attemptId, 'applied');
+  } catch (error) {
+    // Same rule: an ambiguous compensating patch stays unresolved.
+    await failAttempt(ctx, row, op, attempt.attemptId, error);
+  }
+}
+
+async function completeRescheduleTx(
+  deps: RescheduleDeps,
+  row: BookingRow,
+  op: PendingOp,
+  resultingId: string | null,
+  etag: string | null,
 ): Promise<{ superseded: boolean; row: BookingRow }> {
   const { ctx } = deps;
   const result = await ctx.store.withHostLock(row.hostId, async (tx) => {
@@ -520,12 +743,82 @@ async function completeReschedule(
         unresolvedInserts: retained,
       },
     });
-    return { superseded: !ok, row: fresh };
+    if (!ok) {
+      return { superseded: true, row: fresh };
+    }
+    // **This T2's own committed snapshot**, built from the row it conditioned on
+    // plus exactly the patch it applied. Re-reading the row afterwards — even
+    // under a lock — can only observe whatever committed *last*: a later move's
+    // revision, which this worker would then send with its own older
+    // `previousStart` (and could claim that move's delivery rows before its own
+    // worker does), or a cancel's revision, which `pairIsReal` rejects, dropping
+    // this move's notification entirely. Accepted email *arrival* reordering
+    // does not extend to wrong revision content (REV-03).
+    const committed: BookingRow = {
+      ...fresh,
+      start: op.newStart as string,
+      end: op.newEnd as string,
+      rescheduledFrom: fresh.start,
+      ...(resultingId === null ? {} : { googleEventId: resultingId }),
+      googleEventEtag: etag,
+      calendarState: 'created',
+      revision: fresh.revision + 1,
+      latestAction: 'reschedule',
+      pendingOp: null,
+      reservedStart: null,
+      reservedEnd: null,
+      unresolvedInserts: retained,
+    };
+    return { superseded: false, row: committed };
   });
-  if (result.superseded) {
-    return result;
+  return result;
+}
+
+/**
+ * Completes a **taken-over** reschedule from observed Google state (C6.6/C6.7).
+ *
+ * A cancel — or another reschedule — that finds a stale reschedule whose move
+ * did land must finish it via *its own* T2: `revision + 1`, the resulting event
+ * id, and the `(revision, 'reschedule')` emails. Declaring it complete without
+ * running that T2 would leave the row at the old revision while the caller
+ * continues against `revision + 1`, which is the `booking_changed` C6.7
+ * explicitly does not want here.
+ */
+export async function completeInheritedReschedule(
+  deps: RescheduleDeps,
+  row: BookingRow,
+  op: PendingOp,
+): Promise<void> {
+  const { ctx } = deps;
+  const previousStart = row.start;
+
+  let resultingId: string | null = null;
+  let etag: string | null = null;
+
+  if (op.oldEventId !== undefined) {
+    const observed = await observeId(ctx, row.id, op.oldEventId);
+    if (observed.state === 'present' && observed.event.start === op.newStart) {
+      resultingId = op.oldEventId;
+      etag = observed.event.etag;
+    }
   }
-  return { superseded: false, row: (await ctx.store.getById(row.id)) ?? result.row };
+  if (resultingId === null && op.fallbackEventId !== undefined) {
+    const observed = await observeId(ctx, row.id, op.fallbackEventId);
+    if (observed.state === 'present') {
+      resultingId = op.fallbackEventId;
+      etag = observed.event.etag;
+    }
+  }
+  if (resultingId === null) {
+    // Nothing achieved after all: leave the op to the caller's abandon path.
+    return;
+  }
+
+  const completed = await completeReschedule(deps, row, op, resultingId, etag);
+  if (completed.superseded) {
+    return;
+  }
+  await deps.notify(completed.row, previousStart);
 }
 
 /** T2′ — abandons the op, releases the reservation, retains outstanding ids. */
@@ -570,12 +863,23 @@ async function supersededReschedule(
   op: PendingOp,
   ownInsert: { eventId: string; attemptId: string; etag: string } | null,
 ): Promise<RescheduleOutcome> {
-  const decision = await reconcileSuperseded(deps.ctx, {
-    kind: 'reschedule',
-    op,
-    bookingId: row.id,
-    target: op.newStart as string,
-  });
+  const decision = await reconcileSuperseded(
+    deps.ctx,
+    {
+      kind: 'reschedule',
+      op,
+      bookingId: row.id,
+      target: op.newStart as string,
+      // The attempt this worker actually issued: `insertFallback` persists it
+      // through `writeAttempt` and never touches the local `op.attempts`, so
+      // without this eligibility would read `false` and the retired event would
+      // be left behind (REV-02).
+      ...(ownInsert === null
+        ? {}
+        : { ownInsert: { attemptId: ownInsert.attemptId, eventId: ownInsert.eventId } }),
+    },
+    row.hostId,
+  );
 
   if (decision.eligible && ownInsert !== null) {
     await cleanupOwnEvent(

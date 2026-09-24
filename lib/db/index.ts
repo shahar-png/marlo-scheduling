@@ -6,6 +6,9 @@
 // unknown-commit reconciliation must reacquire the host advisory lock on a
 // **fresh** connection — the fake asserts it really was a different one.
 
+import { resolveEnv } from '../env';
+import { createPgDatabase } from './driver';
+
 export type QueryOptions = {
   /** Per-query server-side bound (C13's health readiness query). */
   statementTimeoutMs?: number;
@@ -14,6 +17,13 @@ export type QueryOptions = {
 export type QueryResult<R = Record<string, unknown>> = {
   rows: R[];
   rowCount: number;
+  /**
+   * The command tag Postgres answered with. Only `COMMIT` reads it: a
+   * transaction the server has aborted answers `COMMIT` with **`ROLLBACK`**
+   * and no error at all, so ignoring the tag lets a caller act on writes that
+   * were discarded (REVIEW-01).
+   */
+  command?: string;
 };
 
 export interface Queryable {
@@ -34,10 +44,57 @@ export interface Database extends Queryable {
 }
 
 let injected: Database | null = null;
+let initError: Error | null = null;
 
 /** Test/runtime seam: pins the database the stores and health route use. */
 export function setDatabase(db: Database | null): void {
   injected = db;
+  initError = null;
+}
+
+/**
+ * The database `DATABASE_URL` selects, initialized on first use.
+ *
+ * There is **no memory fallback**: once `DATABASE_URL` is set the store mode is
+ * `pg`, and a deployment that cannot reach a driver or a connection string must
+ * report itself unavailable (503) rather than quietly serve from a per-isolate
+ * map that loses every booking.
+ */
+export function ensureDatabase(): Database {
+  if (injected !== null) {
+    return injected;
+  }
+  if (initError !== null) {
+    throw initError;
+  }
+  const url = resolveEnv().databaseUrl;
+  if (url === null) {
+    initError = new DatabaseUnavailableError('DATABASE_URL is not set');
+    throw initError;
+  }
+  try {
+    injected = createPgDatabase(url);
+    return injected;
+  } catch (error) {
+    // **Normalised**, not preserved: `errorResponse` maps exactly one database
+    // error type, so a `DriverUnavailableError` passed through unchanged escapes
+    // as an untyped 500 instead of the documented 503 `store_driver_unavailable`
+    // (REV-07). The original message is kept as the detail.
+    initError = new DatabaseUnavailableError(detailOf(error));
+    throw initError;
+  }
+}
+
+function detailOf(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+/** The recorded initialization failure, if one has happened. */
+export function databaseInitError(): Error | null {
+  return initError;
 }
 
 export function getDatabase(): Database {
@@ -53,10 +110,10 @@ export function hasDatabase(): boolean {
 
 export class DatabaseUnavailableError extends Error {
   readonly code = 'store_driver_unavailable';
-  constructor() {
+  constructor(detail = 'no Postgres driver is wired') {
     super(
-      'store_driver_unavailable: no Postgres driver is wired. Install a driver ' +
-        'and call setDatabase() during boot (see README → Durable store).',
+      `store_driver_unavailable: ${detail}. Install a driver and set ` +
+        'DATABASE_URL (see README → Durable store).',
     );
     this.name = 'DatabaseUnavailableError';
   }
@@ -95,6 +152,18 @@ export function classifyCommitError(error: unknown): CommitOutcome {
     return 'unknown';
   }
   return 'definite';
+}
+
+/**
+ * `COMMIT` answered `ROLLBACK`: the transaction was aborted by an earlier
+ * failed statement and kept nothing. Definite, never unknown.
+ */
+export class TransactionAbortedError extends Error {
+  readonly outcome: CommitOutcome = 'definite';
+  constructor() {
+    super('transaction aborted: COMMIT answered ROLLBACK');
+    this.name = 'TransactionAbortedError';
+  }
 }
 
 export class UnknownCommitError extends Error {
@@ -138,8 +207,19 @@ export async function withTransaction<T>(
       throw error;
     }
     try {
-      await connection.query('COMMIT');
+      const committed = await connection.query('COMMIT');
+      if (committed.command === 'ROLLBACK') {
+        // A statement inside this transaction failed and left it aborted, so
+        // the server discarded every write and answered `COMMIT` with
+        // `ROLLBACK` — success-shaped, but nothing was kept. This is a
+        // **definite** failure: the caller must not act on anything it wrote
+        // (REVIEW-01).
+        throw new TransactionAbortedError();
+      }
     } catch (error) {
+      if (error instanceof TransactionAbortedError) {
+        throw error;
+      }
       if (classifyCommitError(error) === 'unknown') {
         return { commitUnknown: true, cause: error };
       }

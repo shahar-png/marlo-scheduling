@@ -81,28 +81,34 @@ export async function materializeOwner(
   });
 
   const scheduleId = scheduleIdFor(slug, DEFAULT_SCHEDULE_KEY);
+  const windows = WEEKDAYS.map((weekday) => ({
+    weekday,
+    start: '09:00',
+    end: '20:00',
+  }));
   if (getAvailabilitySchedule(scheduleId) === null) {
     createAvailabilitySchedule({
       id: scheduleId,
       // The host id IS the owner id in this slice: one host per owner.
       hostId: owner.id,
       timezone: 'UTC',
-      windows: WEEKDAYS.map((weekday) => ({
-        weekday,
-        start: '09:00',
-        end: '20:00',
-      })),
+      windows,
     });
   }
+  // …and durably, through the same store the catalog reads. In memory mode this
+  // is a no-op; in pg mode it is what makes the owner resolvable at all (C1).
+  await owners.upsertSchedule({
+    id: scheduleId,
+    ownerId: owner.id,
+    timezone: 'UTC',
+    windows,
+  });
 
   const eventTypes: EventType[] = [];
   for (const fixture of FIXTURE_EVENT_TYPES) {
     const existing = resolveEventType(owner.id, fixture.slug);
-    if (existing !== null) {
-      eventTypes.push(existing);
-      continue;
-    }
-    eventTypes.push(
+    const eventType =
+      existing ??
       createEventType({
         id: eventTypeIdFor(slug, fixture.slug),
         ownerId: owner.id,
@@ -116,8 +122,17 @@ export async function materializeOwner(
         ...(fixture.notificationMode === undefined
           ? {}
           : { notificationMode: fixture.notificationMode }),
-      }),
-    );
+      });
+    eventTypes.push(eventType);
+    await owners.upsertEventType({
+      id: eventType.id,
+      ownerId: owner.id,
+      slug: eventType.slug,
+      name: eventType.name,
+      durationMinutes: eventType.durationMinutes,
+      scheduleId: eventType.availabilityScheduleId,
+      notificationMode: eventType.notificationMode,
+    });
   }
 
   return { owner, eventTypes };

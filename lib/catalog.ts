@@ -16,6 +16,7 @@
 import {
   COLLECTIVE,
   GROUP,
+  getEventType,
   resolveEventType,
   type EventType,
   type EventTypeKind,
@@ -39,6 +40,13 @@ export type ResolvedCatalog = {
 export type CatalogSource = {
   owner(slug: string): Promise<Owner | null>;
   eventType(ownerId: string, slug: string): Promise<EventType | null>;
+  /**
+   * Resolves a **persisted** `eventTypeId` back to its row. A booking stores the
+   * id, not the slug, and the id is only guaranteed to be the deterministic C1
+   * string for records materialization wrote — a retained fixture row may carry
+   * a plain uuid, so deriving the slug from the id is not safe.
+   */
+  eventTypeById(id: string): Promise<EventType | null>;
   schedule(scheduleId: string): Promise<AvailabilitySchedule | null>;
 };
 
@@ -100,6 +108,7 @@ export function memoryCatalogSource(owners: {
   return {
     owner: (slug) => owners.getBySlug(slug),
     eventType: async (ownerId, slug) => resolveEventType(ownerId, slug),
+    eventTypeById: async (id) => getEventType(id),
     schedule: async (scheduleId) => getAvailabilitySchedule(scheduleId),
   };
 }
@@ -107,6 +116,10 @@ export function memoryCatalogSource(owners: {
 export const SELECT_EVENT_TYPE_SQL = `SELECT id, owner_id, slug, kind, duration_min, capacity,
     notification_mode, schedule_id, name
   FROM event_types WHERE owner_id = $1 AND slug = $2`;
+
+export const SELECT_EVENT_TYPE_BY_ID_SQL = `SELECT id, owner_id, slug, kind, duration_min, capacity,
+    notification_mode, schedule_id, name
+  FROM event_types WHERE id = $1`;
 
 export const SELECT_SCHEDULE_SQL =
   'SELECT id, owner_id, timezone, rules FROM availability_schedules WHERE id = $1';
@@ -124,6 +137,13 @@ export function pgCatalogSource(
     owner: (slug) => owners.getBySlug(slug),
     async eventType(ownerId, slug) {
       const result = await db.query(SELECT_EVENT_TYPE_SQL, [ownerId, slug]);
+      if (result.rows.length === 0) {
+        return null;
+      }
+      return mapEventType(result.rows[0]);
+    },
+    async eventTypeById(id) {
+      const result = await db.query(SELECT_EVENT_TYPE_BY_ID_SQL, [id]);
       if (result.rows.length === 0) {
         return null;
       }

@@ -1,6 +1,5 @@
-import { getBooking } from '@/lib/booking/booking';
 import { readBooking } from '@/lib/booking/service';
-import { authorizedScope, resolveBookingId } from '@/lib/api/booking-routes';
+import { authorizedScope, durableRowOf, resolveBookingId } from '@/lib/api/booking-routes';
 import { errorResponse } from '@/lib/api/route-helpers';
 
 // C2 / C11 — `GET /api/bookings/{id}`, token-authenticated with
@@ -21,22 +20,21 @@ export async function GET(
   const { id } = await context.params;
   const resolved = await resolveBookingId(id);
 
-  if (resolved.kind === 'durable') {
-    try {
-      const scope = await authorizedScope(request, resolved.row);
-      return Response.json(await readBooking(scope), { status: 200 });
-    } catch (error) {
-      const mapped = errorResponse(error);
-      if (mapped !== null) {
-        return mapped;
-      }
-      throw error;
-    }
+  // Only an existing fixture row takes the legacy read; an id that resolves to
+  // nothing is authenticated exactly like a durable one, so the response can
+  // never reveal whether the booking exists (C11 — REV-08).
+  if (resolved.kind === 'legacy') {
+    return Response.json({ booking: resolved.booking });
   }
 
-  const legacy = getBooking(id);
-  if (!legacy) {
-    return Response.json({ error: 'booking not found' }, { status: 404 });
+  try {
+    const scope = await authorizedScope(request, durableRowOf(resolved));
+    return Response.json(await readBooking(scope), { status: 200 });
+  } catch (error) {
+    const mapped = errorResponse(error);
+    if (mapped !== null) {
+      return mapped;
+    }
+    throw error;
   }
-  return Response.json({ booking: legacy });
 }

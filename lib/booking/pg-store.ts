@@ -298,6 +298,30 @@ export const STAMP_REAP_SQL = `UPDATE bookings
 class PgTx implements BookingTx {
   constructor(private readonly tx: Queryable) {}
 
+  private savepointSeq = 0;
+
+  /**
+   * `SAVEPOINT` → run → `RELEASE`, or `ROLLBACK TO SAVEPOINT` on failure, so a
+   * recoverable error leaves the transaction usable instead of aborted
+   * (REVIEW-01). The name is generated here and never interpolated from input.
+   */
+  async attempt<T>(
+    fn: () => Promise<T>,
+  ): Promise<{ ok: true; value: T } | { ok: false; error: unknown }> {
+    this.savepointSeq += 1;
+    const name = `marlo_sp_${this.savepointSeq}`;
+    await this.tx.query(`SAVEPOINT ${name}`);
+    try {
+      const value = await fn();
+      await this.tx.query(`RELEASE SAVEPOINT ${name}`);
+      return { ok: true, value };
+    } catch (error) {
+      await this.tx.query(`ROLLBACK TO SAVEPOINT ${name}`);
+      await this.tx.query(`RELEASE SAVEPOINT ${name}`);
+      return { ok: false, error };
+    }
+  }
+
   async lookupKey(ownerId: string, idempotencyKey: string): Promise<BookingRow | null> {
     const result = await this.tx.query(SELECT_BY_KEY, [ownerId, idempotencyKey]);
     return result.rows.length === 0 ? null : mapRow(result.rows[0]);
@@ -467,16 +491,21 @@ class PgTx implements BookingTx {
     resolvedAt: string,
   ): Promise<boolean> {
     const result = await this.tx.query(
+      // Parameters are contiguous ($1..$4): Postgres rejects a gap because it
+      // cannot infer the skipped placeholder's type. `gen` is deliberately NOT
+      // in the predicate — an attempt is finalised by the worker that ISSUED it
+      // (C6.3b), which may since have been superseded under a higher generation,
+      // and `attemptId` already identifies exactly one entry.
       `UPDATE bookings
          SET pending_op = jsonb_set(pending_op, '{attempts}', (
            SELECT COALESCE(jsonb_agg(
-             CASE WHEN entry->>'attemptId' = $4 AND entry->>'outcome' = 'unresolved'
-                  THEN entry || jsonb_build_object('outcome', $5::text, 'resolvedAt', $6::text)
+             CASE WHEN entry->>'attemptId' = $3 AND entry->>'outcome' = 'unresolved'
+                  THEN entry || jsonb_build_object('outcome', $4::text, 'resolvedAt', $5::text)
                   ELSE entry END), '[]'::jsonb)
              FROM jsonb_array_elements(COALESCE(pending_op->'attempts', '[]'::jsonb)) AS entry
          ))
          WHERE id = $1 AND pending_op->>'opId' = $2`,
-      [id, opId, attemptId, attemptId, outcome, resolvedAt],
+      [id, opId, attemptId, outcome, resolvedAt],
     );
     return result.rowCount > 0;
   }
@@ -501,6 +530,28 @@ class PgTx implements BookingTx {
 
   async retireAttempt(id: string, attemptId: string): Promise<void> {
     await this.tx.query(RETIRE_ATTEMPT_SQL, [id, attemptId]);
+  }
+
+  /** The same C5 claim SQL, on this transaction's connection (C5 / REV2-06). */
+  async claimDelivery(input: {
+    bookingId: string;
+    revision: number;
+    action: DeliveryAction;
+    recipient: DeliveryRecipient;
+    nowMs: number;
+  }): Promise<LedgerClaim> {
+    const result = await this.tx.query<{ attempts: unknown }>(CLAIM_SQL, [
+      input.bookingId,
+      input.revision,
+      input.action,
+      input.recipient,
+      new Date(input.nowMs).toISOString(),
+      new Date(input.nowMs - CLAIM_STALE_MS).toISOString(),
+    ]);
+    if (result.rows.length === 0) {
+      return null;
+    }
+    return { gen: Number(result.rows[0].attempts) };
   }
 }
 

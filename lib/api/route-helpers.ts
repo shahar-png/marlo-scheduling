@@ -8,7 +8,7 @@ import {
 } from '../booking/errors';
 import { AvailabilityUnknownError } from '../google/errors';
 import { EmailAddressError } from '../email/address';
-import { NotMigratedError } from '../db/index';
+import { DatabaseUnavailableError, NotMigratedError, UnknownCommitError } from '../db/index';
 import { OutcomeUnresolvedError } from '../booking/store';
 import { ReservedOwnerSlugError } from '../owners';
 import { constantTimeEqual } from '../booking/ids';
@@ -23,7 +23,11 @@ export function errorResponse(error: unknown): Response | null {
   if (error instanceof AvailabilityUnknownError) {
     return Response.json({ error: 'availability_unknown' }, { status: 503 });
   }
-  if (error instanceof OutcomeUnresolvedError) {
+  if (error instanceof OutcomeUnresolvedError || error instanceof UnknownCommitError) {
+    // An unknown commit outcome is 503 `booking_outcome_unknown` wherever it
+    // surfaces. Every completing transaction resolves it through C6.5 first;
+    // this is the defensive mapping that keeps one escaping as an untyped 500
+    // (REV-05).
     return Response.json(
       { error: 'booking_outcome_unknown', retryAfterSeconds: 5 },
       { status: 503 },
@@ -36,6 +40,11 @@ export function errorResponse(error: unknown): Response | null {
     return Response.json({ error: error.code }, { status: 404 });
   }
   if (error instanceof NotMigratedError) {
+    return Response.json({ error: error.code }, { status: 503 });
+  }
+  if (error instanceof DatabaseUnavailableError) {
+    // `DATABASE_URL` selected pg and the database could not be initialized:
+    // unavailable, never a silent memory fallback.
     return Response.json({ error: error.code }, { status: 503 });
   }
   return null;

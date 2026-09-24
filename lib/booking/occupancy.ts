@@ -18,9 +18,8 @@ import { AvailabilityUnknownError } from '../google/errors';
 import { isBusyCandidate, isManaged, type CalendarListItem } from '../google/calendar';
 import { logLifecycle } from './log';
 import type { LifecycleContext } from './ops';
+import { selectListedBatch } from './reap';
 import {
-  eligibleReapIds,
-  orderReapCandidates,
   overlaps,
   REAP_MAX_PER_REQUEST,
   type BookingRow,
@@ -94,33 +93,15 @@ export function classifyBusy(
     }
 
     const row = resolve(item.marloBookingId as string);
-    if (row === null || row.status === 'cancelled') {
-      if (row !== null && options.excludeBookingId === row.id) {
-        // The booking's own managed event during its own reschedule.
-        continue;
-      }
-      if (row !== null && isRetiredId(row, item.id)) {
-        reapCandidates.push({
-          bookingId: row.id,
-          hostId: row.hostId,
-          eventId: item.id,
-          etag: item.etag,
-          attemptId: item.marloAttemptId,
-        });
-      }
-      // Unmatched managed item: conservatively busy at its actual interval.
-      busy.push(interval);
-      continue;
-    }
 
-    if (options.excludeBookingId === row.id) {
-      continue;
-    }
-
-    if (isRetiredId(row, item.id)) {
-      // A late-landed insert of a superseded or timed-out attempt: busy for
-      // THIS request whether or not the reap succeeds, so it can never
-      // free-ride into a double booking (C6.3a).
+    // **Retired ids are classified before the own-booking exclusion**
+    // (REVIEW-02). The exclusion covers a booking's *own* event during its own
+    // reschedule — its live id and its reservation — never an id the row has
+    // already retired. A late insert under the fallback-reschedule leftover of
+    // the very booking being rescheduled is still a foreign event on the host's
+    // calendar: it must be busy for this request and reap-eligible, exactly as
+    // it is for every other request (C6.3a, C7).
+    if (row !== null && isRetiredId(row, item.id)) {
       reapCandidates.push({
         bookingId: row.id,
         hostId: row.hostId,
@@ -129,6 +110,20 @@ export function classifyBusy(
         attemptId: item.marloAttemptId,
       });
       busy.push(interval);
+      continue;
+    }
+
+    if (row === null || row.status === 'cancelled') {
+      if (row !== null && options.excludeBookingId === row.id) {
+        // The booking's own managed event during its own reschedule.
+        continue;
+      }
+      // Unmatched managed item: conservatively busy at its actual interval.
+      busy.push(interval);
+      continue;
+    }
+
+    if (options.excludeBookingId === row.id) {
       continue;
     }
 
@@ -226,17 +221,20 @@ export async function reapListedItems(
 
   const chosen: ClassifiedBusy['reapCandidates'] = [];
   for (const [bookingId, list] of byRow) {
-    const row = await ctx.store.findByBookingIdForReap(bookingId);
-    if (row === null) {
-      continue;
+    if (chosen.length >= max) {
+      break;
     }
-    const eligible = eligibleReapIds(row).filter((eventId) =>
-      list.some((candidate) => candidate.eventId === eventId),
+    // Selection AND stamping inside one locked transaction, before any Google
+    // call — the same procedure the row-read reaper uses (C6.3a, REVIEW-07).
+    const batch = await selectListedBatch(
+      ctx,
+      bookingId,
+      list.map((candidate) => candidate.eventId),
+      max - chosen.length,
     );
-    const ordered = orderReapCandidates(row, eligible);
-    for (const eventId of ordered) {
+    for (const eventId of batch) {
       const candidate = list.find((entry) => entry.eventId === eventId);
-      if (candidate !== undefined && chosen.length < max) {
+      if (candidate !== undefined) {
         chosen.push(candidate);
       }
     }
@@ -244,13 +242,6 @@ export async function reapListedItems(
 
   const deleted: string[] = [];
   for (const candidate of chosen) {
-    // `inspectSeq` is stamped under the host lock before the Google call, from
-    // the row's monotonic `reap_cursor` — exactly as the C6.3a reap does.
-    await ctx.store.stampReapBatch(
-      candidate.bookingId,
-      [candidate.eventId],
-      new Date(ctx.clock.now()).toISOString(),
-    );
     try {
       await ctx.calendar.remove({
         calendarId: ctx.calendarId,

@@ -14,6 +14,11 @@ export type LifecycleLogCode =
   | 'create_fenced'
   | 'stale_response_ignored'
   | 'notify_no_pair'
+  /** A lifecycle send whose `(revision, action)` is not a pair the row held. */
+  | 'notify_pair_mismatch'
+  /** The ledger itself was unreachable; delivery is unresolved, not failed. */
+  | 'delivery_claim_failed'
+  | 'delivery_finalize_failed'
   | 'create_identity_mismatch'
   | 'unfinished_create_orphan'
   | 'gmail_send_failed'

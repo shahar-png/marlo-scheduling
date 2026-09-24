@@ -1,4 +1,5 @@
-import { createBooking } from '@/lib/booking/service';
+import { createBookingEntry } from '@/lib/booking/service';
+import { fixtureCreateResponse } from '@/lib/booking/fixture-create';
 import { ensureOwnerFixtures } from '@/lib/booking/fixtures';
 import {
   errorResponse,
@@ -40,21 +41,31 @@ export async function POST(
     );
   }
 
-  await ensureOwnerFixtures(ownerSlug);
-
   try {
-    const outcome = await createBooking({
-      ownerSlug,
-      eventSlug,
-      start,
-      invitee: { name, email },
-      notes: typeof body.notes === 'string' ? body.notes : null,
-      idempotencyKey: idempotencyKeyOf(request),
-      origin: originOf(request),
-    });
+    // Inside the boundary: seeding resolves the runtime, and in pg mode that is
+    // where a missing driver or an unreachable database surfaces (REV-07).
+    await ensureOwnerFixtures(ownerSlug);
+    const result = await createBookingEntry(
+      {
+        ownerSlug,
+        eventSlug,
+        start,
+        invitee: { name, email },
+        notes: typeof body.notes === 'string' ? body.notes : null,
+        idempotencyKey: idempotencyKeyOf(request),
+        origin: originOf(request),
+      },
+      // C6.9 — a memory-mode `group`/`collective` keeps its existing fixture
+      // path, reached before the key check ever runs (REV15-03).
+      (eventType) =>
+        fixtureCreateResponse({ eventType, start, invitee: { name, email } }),
+    );
+    if (result.kind === 'fixture') {
+      return result.response;
+    }
     // 201 whenever the booking row is committed — an email failure never turns
     // a committed booking into a 4xx/5xx (AC-10).
-    return Response.json(outcome.envelope, { status: 201 });
+    return Response.json(result.outcome.envelope, { status: 201 });
   } catch (error) {
     const mapped = errorResponse(error);
     if (mapped !== null) {

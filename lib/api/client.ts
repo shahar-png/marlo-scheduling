@@ -1,12 +1,15 @@
 import { encodePathSegment } from './public-path';
-import { fetchTransport, type Transport } from './transport';
+import { fetchTransport, type ApiResponse, type Transport } from './transport';
 import {
   ApiError,
   SESSION_FULL,
   SLOT_UNAVAILABLE,
   UNKNOWN_ERROR,
   type BookingApi,
+  type BookingCredentials,
+  type BookingDelivery,
   type Clock,
+  type LifecycleResult,
   type CreateBookingInput,
   type CreateBookingResult,
   type GetSlotsInput,
@@ -37,6 +40,22 @@ export type ApiClientOptions = {
 
 export type ApiClient = BookingApi & {
   getBooking(token: string): Promise<PublicBooking | null>;
+  /** C9 — replays a stored `{ key, payload }` without the new-submission gates. */
+  recoverBooking(input: CreateBookingInput): Promise<CreateBookingResult>;
+  // C11 / C12 — the token-authenticated booking surface.
+  getBookingById(input: BookingCredentials): Promise<PublicBooking | null>;
+  getBookingAvailability(
+    input: BookingCredentials & { timeMin: string; timeMax: string },
+  ): Promise<SlotsResult>;
+  rescheduleBooking(
+    input: BookingCredentials & { start: string; expectedRevision: number },
+  ): Promise<LifecycleResult>;
+  cancelBooking(
+    input: BookingCredentials & { expectedRevision: number },
+  ): Promise<LifecycleResult>;
+  retryNotification(
+    input: BookingCredentials & { action?: string; expectedRevision?: number },
+  ): Promise<LifecycleResult>;
 };
 
 export function createApiClient(options: ApiClientOptions = {}): ApiClient {
@@ -76,10 +95,19 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       timeMin: new Date(minMs).toISOString(),
       timeMax: new Date(backendMaxMs).toISOString(),
     });
-    const response = await transport({
-      method: 'GET',
-      path: `/api/event-types/${slugSegment}/available-times?${query}`,
-    });
+    // C1/C2: the product page reads the owner-scoped route. Falling back to the
+    // legacy demo route with an owner in hand would show demo availability
+    // while the booking POST went to that owner's calendar.
+    const ownerSegment =
+      input.ownerSlug === undefined ? null : encodePathSegment(input.ownerSlug);
+    if (input.ownerSlug !== undefined && ownerSegment === null) {
+      return { times: [] };
+    }
+    const path =
+      ownerSegment === null
+        ? `/api/event-types/${slugSegment}/available-times?${query}`
+        : `/api/owners/${ownerSegment}/event-types/${slugSegment}/available-times?${query}`;
+    const response = await transport({ method: 'GET', path });
     if (response.status !== 200) {
       throw new ApiError(response.status, errorMessage(response.body));
     }
@@ -106,6 +134,26 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     if (!Number.isFinite(startMs) || startMs < now().getTime()) {
       return { ok: false, code: SLOT_UNAVAILABLE };
     }
+    return postBooking(input);
+  }
+
+  /**
+   * C9 reload recovery. The same `POST` with the same header, through an entry
+   * point that **bypasses the new-submission gates**: no elapsed-start check and
+   * no requirement that `start` still appears in availability. A replay is not a
+   * new submission — the row may already exist, and refusing to finish it
+   * because its slot has since passed is exactly how a committed booking gets
+   * stranded (REV3-06). Those gates still apply to `createBooking`.
+   */
+  async function recoverBooking(
+    input: CreateBookingInput,
+  ): Promise<CreateBookingResult> {
+    return postBooking(input);
+  }
+
+  async function postBooking(
+    input: CreateBookingInput,
+  ): Promise<CreateBookingResult> {
     // Unrepresentable slug: never a request whose path would be split on
     // `#` / `?` / `/` — an `unknown`-coded failure with zero backend calls.
     const slugSegment = encodePathSegment(input.slug);
@@ -151,15 +199,31 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       if (error === SLOT_UNAVAILABLE || error === SESSION_FULL) {
         return { ok: false, code: error };
       }
-      // Unrecognised 409 body: never coerce to slot_unavailable.
-      return { ok: false, code: UNKNOWN_ERROR, status: 409, error };
+      // Unrecognised 409 body: never coerce to slot_unavailable. The server's
+      // `retryAfterSeconds` is carried through — `operation_in_progress` is
+      // non-terminal and the form owes it one automatic replay (C9).
+      return {
+        ok: false,
+        code: UNKNOWN_ERROR,
+        status: 409,
+        error,
+        ...retryAfterOf(response.body),
+      };
     }
     return {
       ok: false,
       code: UNKNOWN_ERROR,
       status: response.status,
       error: errorMessage(response.body),
+      ...retryAfterOf(response.body),
     };
+  }
+
+  function retryAfterOf(body: unknown): { retryAfterSeconds?: number } {
+    const record = isRecord(body) ? body : {};
+    return typeof record.retryAfterSeconds === 'number'
+      ? { retryAfterSeconds: record.retryAfterSeconds }
+      : {};
   }
 
   async function getBooking(token: string): Promise<PublicBooking | null> {
@@ -167,7 +231,12 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       method: 'GET',
       path: `/api/bookings/${encodeURIComponent(token)}`,
     });
-    if (response.status === 404) {
+    // C11 — this retained read sends no bearer, so the route answers 401
+    // `token_required` for **every** id it cannot serve unauthenticated,
+    // whether or not a booking exists under it (the uniform contract of
+    // REV-08). An unauthenticated read that finds nothing it may return is
+    // `null` here, exactly as a 404 was.
+    if (response.status === 404 || response.status === 401) {
       return null;
     }
     if (response.status !== 200) {
@@ -176,7 +245,139 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     return mapBooking(bookingOf(response.body));
   }
 
-  return { getSlots, createBooking, getBooking };
+  // ---- C11 / C12: the token-authenticated booking surface -----------------
+  //
+  // Every one of these takes the booking's `id` in the path and its `token` in
+  // `Authorization: Bearer` — never the token in the path, the query string, or
+  // the body. They return a discriminated result rather than throwing, because
+  // the `/b/{token}` control machine (C12) branches on the code.
+
+  function bearer(token: string): Record<string, string> {
+    return { authorization: `Bearer ${token}` };
+  }
+
+  function lifecycleResult(response: ApiResponse): LifecycleResult {
+    if (response.status === 200) {
+      const mapped = mapBooking(bookingOf(response.body));
+      if (mapped === null) {
+        return { ok: false, status: 200, code: UNKNOWN_ERROR };
+      }
+      const delivery = mapDelivery(response.body);
+      return {
+        ok: true,
+        booking: delivery === undefined ? mapped : { ...mapped, delivery },
+      };
+    }
+    const code = errorMessage(response.body) || UNKNOWN_ERROR;
+    const body = isRecord(response.body) ? response.body : {};
+    return {
+      ok: false,
+      status: response.status,
+      code,
+      ...(typeof body.retryAfterSeconds === 'number'
+        ? { retryAfterSeconds: body.retryAfterSeconds }
+        : {}),
+      ...(mapBooking(bookingOf(response.body)) === null
+        ? {}
+        : { booking: mapBooking(bookingOf(response.body)) as PublicBooking }),
+    };
+  }
+
+  async function getBookingById(input: BookingCredentials): Promise<PublicBooking | null> {
+    const response = await transport({
+      method: 'GET',
+      path: `/api/bookings/${encodeURIComponent(input.id)}`,
+      headers: bearer(input.token),
+    });
+    if (response.status === 404 || response.status === 401) {
+      return null;
+    }
+    if (response.status !== 200) {
+      throw new ApiError(response.status, errorMessage(response.body));
+    }
+    const mapped = mapBooking(bookingOf(response.body));
+    if (mapped === null) {
+      return null;
+    }
+    const delivery = mapDelivery(response.body);
+    return delivery === undefined ? mapped : { ...mapped, delivery };
+  }
+
+  async function getBookingAvailability(
+    input: BookingCredentials & { timeMin: string; timeMax: string },
+  ): Promise<SlotsResult> {
+    const query = new URLSearchParams({
+      timeMin: input.timeMin,
+      timeMax: input.timeMax,
+    });
+    const response = await transport({
+      method: 'GET',
+      path: `/api/bookings/${encodeURIComponent(input.id)}/available-times?${query}`,
+      headers: bearer(input.token),
+    });
+    if (response.status !== 200) {
+      throw new ApiError(response.status, errorMessage(response.body));
+    }
+    return { times: normalizeTimes(response.body) };
+  }
+
+  async function rescheduleBooking(
+    input: BookingCredentials & { start: string; expectedRevision: number },
+  ): Promise<LifecycleResult> {
+    return lifecycleResult(
+      await transport({
+        method: 'POST',
+        path: `/api/bookings/${encodeURIComponent(input.id)}/reschedule`,
+        body: { start: input.start, expectedRevision: input.expectedRevision },
+        headers: bearer(input.token),
+      }),
+    );
+  }
+
+  async function cancelBooking(
+    input: BookingCredentials & { expectedRevision: number },
+  ): Promise<LifecycleResult> {
+    return lifecycleResult(
+      await transport({
+        method: 'POST',
+        path: `/api/bookings/${encodeURIComponent(input.id)}/cancel`,
+        body: { expectedRevision: input.expectedRevision },
+        headers: bearer(input.token),
+      }),
+    );
+  }
+
+  async function retryNotification(
+    input: BookingCredentials & { action?: string; expectedRevision?: number },
+  ): Promise<LifecycleResult> {
+    // C5 has exactly two request forms: `{ action, expectedRevision }` and `{}`.
+    // Sending one field without the other is 400 by contract, so the client
+    // sends both or neither.
+    const body =
+      input.action === undefined || input.expectedRevision === undefined
+        ? {}
+        : { action: input.action, expectedRevision: input.expectedRevision };
+    return lifecycleResult(
+      await transport({
+        method: 'POST',
+        path: `/api/bookings/${encodeURIComponent(input.id)}/notify`,
+        body,
+        headers: bearer(input.token),
+      }),
+    );
+  }
+
+  return {
+    getSlots,
+    createBooking,
+    recoverBooking,
+    getBooking,
+    getBookingById,
+    getBookingAvailability,
+    rescheduleBooking,
+    cancelBooking,
+    retryNotification,
+  };
 }
 
 export type RepoBooking = {
@@ -293,3 +494,5 @@ const productionClient = createApiClient();
 export const getSlots = productionClient.getSlots;
 export const createBooking = productionClient.createBooking;
 export const getBooking = productionClient.getBooking;
+/** C9 — the gate-free replay the unresolved-submission recovery uses. */
+export const recoverBooking = productionClient.recoverBooking;

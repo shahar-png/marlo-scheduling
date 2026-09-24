@@ -136,12 +136,39 @@ export type HostToken = {
   updatedAt: string;
 };
 
+/** C1 — the schedule materialization writes, under its deterministic id. */
+export type ScheduleRecord = {
+  id: string;
+  ownerId: string;
+  timezone: string;
+  windows: { weekday: number; start: string; end: string }[];
+};
+
+/** C1 — an event type materialization writes. Only `one_on_one` is ever written. */
+export type EventTypeRecord = {
+  id: string;
+  ownerId: string;
+  slug: string;
+  name: string;
+  durationMinutes: number;
+  scheduleId: string;
+  notificationMode: string;
+};
+
 export interface OwnerStore {
   upsert(owner: Owner): Promise<Owner>;
   getBySlug(slug: string): Promise<Owner | null>;
   getById(id: string): Promise<Owner | null>;
   putHostToken(token: HostToken): Promise<void>;
   getHostToken(ownerId: string): Promise<HostToken | null>;
+  /**
+   * C1 — sign-in materialization persists the owner's schedule and event types
+   * **through the same store the catalog reads**. Writing them only to
+   * process-local maps is what would leave a freshly signed-in owner's
+   * `intro-30` unresolvable in pg mode, where the catalog reads SQL.
+   */
+  upsertSchedule(schedule: ScheduleRecord): Promise<void>;
+  upsertEventType(eventType: EventTypeRecord): Promise<void>;
 }
 
 export class MemoryOwnerStore implements OwnerStore {
@@ -184,6 +211,15 @@ export class MemoryOwnerStore implements OwnerStore {
       ? { ...found, refreshTokenEnc: new Uint8Array(found.refreshTokenEnc) }
       : null;
   }
+
+  /**
+   * Memory mode's catalog **is** the in-process fixture registry that
+   * `materializeOwner` already writes through `createAvailabilitySchedule` /
+   * `createEventType`, so there is nothing further to persist here.
+   */
+  async upsertSchedule(): Promise<void> {}
+
+  async upsertEventType(): Promise<void> {}
 
   reset(): void {
     this.bySlug.clear();

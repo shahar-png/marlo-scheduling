@@ -39,7 +39,7 @@ function page(params: PageParams) {
   return BookingPage({ params: Promise.resolve(params) });
 }
 
-function seedEventType(hostId: string, slug: string) {
+function seedEventType(hostId: string, slug: string, ownerId?: string) {
   const schedule = createAvailabilitySchedule({
     hostId,
     timezone: 'UTC',
@@ -52,6 +52,7 @@ function seedEventType(hostId: string, slug: string) {
     durationMinutes: 30,
     availabilityScheduleId: schedule.id,
     kind: 'one_on_one',
+    ...(ownerId === undefined ? {} : { ownerId }),
   });
 }
 
@@ -87,9 +88,25 @@ describe('AC-8 host chrome from hostMetaForHostId (BOOK-FE-15)', () => {
     resetBookings();
   });
 
-  it('(i) non-demo alias canonicalizes: /alice/intro-30 rejects with a NEXT_REDIRECT digest containing /demo/intro-30', async () => {
-    ensureDemoFixtures();
-    await assert.rejects(page({ slug: 'alice', event: 'intro-30' }), isRedirectTo('/demo/intro-30'));
+  it('(i) `[slug]` IS the owner: /ada/intro-30 renders Ada’s page, never a redirect to /demo', async () => {
+    // P1/C1: two owners may both offer `intro-30`, so an owner slug is never
+    // canonicalized away to the demo owner. (The rev-1 alias redirect is gone.)
+    const element = (await page({ slug: 'ada', event: 'intro-30' })) as ReactElement<{
+      slug: string;
+      hostSlug: string;
+      hostMeta: { firstName: string };
+    }>;
+    assert.equal(element.type, BookingClient);
+    assert.equal(element.props.hostSlug, 'ada');
+    assert.equal(element.props.hostMeta.firstName, 'Ada');
+    assert.equal(element.props.slug, 'intro-30');
+  });
+
+  it('(i-b) an unknown owner is the not-found shell, not somebody else’s page', async () => {
+    // In pg mode owners exist only through sign-in materialization; in memory
+    // mode a reserved slug is still refused before any store read (REV5-06).
+    const reserved = (await page({ slug: 'b', event: 'intro-30' })) as ReactElement;
+    assertNotFoundElement(reserved);
   });
 
   it('(ii) canonical alias renders BookingClient with the canonical host props', async () => {
@@ -121,32 +138,33 @@ describe('AC-8 host chrome from hostMetaForHostId (BOOK-FE-15)', () => {
     assert.equal(typeof (seed as Record<string, unknown>).hostFirstNameForSlug, 'undefined');
   });
 
-  it('(v) source: page.tsx and seed.ts derive no name from URL text; page imports redirect + hostMetaForHostId', () => {
+  it('(v) source: the page derives no name from URL text and resolves through the catalog', () => {
     const pageSource = readFileSync(path.join(ROOT, 'app/(public)/[slug]/[event]/page.tsx'), 'utf8');
     const seedSource = readFileSync(path.join(ROOT, 'lib/demo/seed.ts'), 'utf8');
     for (const source of [pageSource, seedSource]) {
       assert.doesNotMatch(source, /hostFirstNameForSlug/);
       assert.doesNotMatch(source, /toUpperCase\(/);
     }
-    assert.match(pageSource, /import \{ redirect \} from 'next\/navigation'/);
-    assert.match(pageSource, /hostMetaForHostId[^;]*from '@\/lib\/demo\/seed'/);
-    assert.match(pageSource, /redirect\(canonicalPath\)/);
-    // The props passed down are the canonical host's, not the URL segment's.
-    assert.match(pageSource, /hostSlug=\{host\.slug\}/);
-    assert.match(pageSource, /hostMeta=\{\{ firstName: host\.firstName \}\}/);
+    // C1: one owner-scoped resolution, and no demo canonicalization.
+    assert.match(pageSource, /resolveScope\(slug, event\)/);
+    assert.doesNotMatch(pageSource, /redirect\(/);
+    assert.doesNotMatch(pageSource, /hostMetaForHostId/);
+    assert.doesNotMatch(pageSource, /getEventTypeBySlug/);
+    // The props passed down are the RESOLVED owner's, not the URL segment's.
+    assert.match(pageSource, /hostSlug=\{scope\.owner\.slug\}/);
+    assert.match(pageSource, /firstName: scope\.owner\.firstName/);
     assert.doesNotMatch(pageSource, /hostSlug=\{slug\}/);
   });
 
-  it('(vi) unknown host: an event type whose hostId has no canonical host renders states.notFound, no BookingClient', async () => {
-    seedEventType('host-9', 'intro-30');
-    assert.equal(hostMetaForHostId('host-9'), null);
+  it('(vi) an event type under a different owner is not served under this one', async () => {
+    // `intro-30` exists, but only for `own_other`. Resolution is per owner, so
+    // the demo owner's page must not serve it (the old global slug lookup did).
+    seedEventType('host-9', 'intro-30', 'own_other');
     let element: ReactElement | undefined;
     await assert.doesNotReject(async () => {
       element = (await page({ slug: 'demo', event: 'intro-30' })) as ReactElement;
     });
     assertNotFoundElement(element!);
-    const alias = (await page({ slug: 'alice', event: 'intro-30' })) as ReactElement;
-    assertNotFoundElement(alias);
   });
 
   it('unknown event renders states.notFound', async () => {
@@ -163,33 +181,26 @@ describe('AC-11 safe public paths on the booking route (BOOK-FE-19)', () => {
     resetBookings();
   });
 
-  it('(vii) unrepresentable slug: intro#follow-up resolves to states.notFound for the alias and the canonical host alike — no redirect', async () => {
+  it('(vii) unrepresentable slug: intro#follow-up resolves to states.notFound — no page, no redirect', async () => {
     seedEventType('host-1', 'intro#follow-up');
     // Precondition this case exists for: the store accepts the slug.
     assert.ok(getEventTypeBySlug('intro#follow-up'));
-
-    let alias: ReactElement | undefined;
-    await assert.doesNotReject(async () => {
-      alias = (await page({ slug: 'alice', event: 'intro#follow-up' })) as ReactElement;
-    });
-    assertNotFoundElement(alias!);
 
     let canonical: ReactElement | undefined;
     await assert.doesNotReject(async () => {
       canonical = (await page({ slug: 'demo', event: 'intro#follow-up' })) as ReactElement;
     });
     assertNotFoundElement(canonical!);
-
-    // The representable demo event still canonicalizes.
-    await assert.rejects(page({ slug: 'alice', event: 'intro-30' }), isRedirectTo('/demo/intro-30'));
   });
 
-  it('a representable non-ASCII slug canonicalizes to its percent-encoded path', async () => {
+  it('a slug the AC-2 validator rejects has no page, however the store stored it', async () => {
+    // `café 30` is representable as a *path* but is not a valid slug
+    // (`^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$`), so owner-scoped resolution
+    // refuses it before any store read rather than serving it.
     seedEventType('host-1', 'café 30');
-    await assert.rejects(page({ slug: 'alice', event: 'café 30' }), isRedirectTo('/demo/caf%C3%A9%2030'));
-    const element = (await page({ slug: 'demo', event: 'café 30' })) as ReactElement<{ slug: string }>;
-    assert.equal(element.type, BookingClient);
-    assert.equal(element.props.slug, 'café 30');
+    assert.ok(getEventTypeBySlug('café 30'));
+    const element = (await page({ slug: 'demo', event: 'café 30' })) as ReactElement;
+    assertNotFoundElement(element);
   });
 
   it('(viii) source: page.tsx imports publicBookingPath and interpolates no path', () => {
@@ -197,6 +208,6 @@ describe('AC-11 safe public paths on the booking route (BOOK-FE-19)', () => {
     assert.match(pageSource, /import \{ publicBookingPath \} from '@\/lib\/api\/public-path'/);
     assert.doesNotMatch(pageSource, /`\/\$\{/);
     assert.doesNotMatch(pageSource, /'\/' \+/);
-    assert.match(pageSource, /publicBookingPath\(host\.slug, eventType\.slug\)/);
+    assert.match(pageSource, /publicBookingPath\(scope\.owner\.slug, scope\.eventType\.slug\)/);
   });
 });

@@ -19,7 +19,7 @@
 // The observed-etag retry after 412 exists only inside that eligibility, which
 // is safe precisely because retired is absorbing (REV5-02).
 
-import { classifyCalendarError } from '../google/errors';
+import { classifyCalendarError, DEFINITE, isAbsenceStatus } from '../google/errors';
 import { createFinalized, createReplacedUnfinished, takeoverRunning, type CreateOpIdentity } from './create-identity';
 import { logLifecycle } from './log';
 import type { LifecycleContext } from './ops';
@@ -46,22 +46,37 @@ export type SupersededDecision = {
   eligible: boolean;
 };
 
-export type SupersededInput =
+/**
+ * The insert this worker actually issued. `op.attempts` is a **local** snapshot
+ * taken before the mutation, so a worker whose attempt was persisted by
+ * `writeAttempt` (a reschedule's fallback insert, a repair's insert) does not
+ * find it there — passing the ids explicitly is what makes eligibility decidable
+ * for those paths instead of silently `false` (REV-02).
+ */
+export type OwnInsertRef = { attemptId: string; eventId: string };
+
+export type SupersededInput = { ownInsert?: OwnInsertRef } & (
   | { kind: 'create'; op: PendingOp; identity: CreateOpIdentity; bookingId: string }
   | { kind: 'reschedule'; op: PendingOp; bookingId: string; target: string }
   | { kind: 'cancel'; op: PendingOp; bookingId: string }
-  | { kind: 'calendar_repair'; op: PendingOp; bookingId: string };
+  | { kind: 'calendar_repair'; op: PendingOp; bookingId: string }
+);
 
 export async function reconcileSuperseded(
   ctx: LifecycleContext,
   input: SupersededInput,
+  /** The host the booking belongs to — the lock eligibility is decided under. */
+  hostId: string,
 ): Promise<SupersededDecision> {
-  const row = await ctx.store.getById(input.bookingId);
+  // C6.3a: both determinations come from **one locked read**. An unlocked read
+  // could observe the row mid-transition and call a retired id live (or the
+  // reverse), and eligibility is exactly the decision that must not be wrong.
+  const row = await ctx.store.withHostLock(hostId, (tx) => tx.selectForUpdate(input.bookingId));
   if (row === null) {
     return { response: 'operation_superseded', row: null, eligible: false };
   }
 
-  const eligible = cleanupEligible(row, input.op);
+  const eligible = cleanupEligible(row, input.op, input.ownInsert);
   const response = decideResponse(ctx, row, input);
 
   if (response.response === 'operation_superseded') {
@@ -137,8 +152,15 @@ function decideResponse(
 }
 
 /** (2) — eligibility, decided by the id's state and nothing else. */
-export function cleanupEligible(row: BookingRow, op: PendingOp): boolean {
-  const intended = op.kind === 'reschedule' ? op.fallbackEventId : op.eventId;
+export function cleanupEligible(
+  row: BookingRow,
+  op: PendingOp,
+  ownInsert?: OwnInsertRef,
+): boolean {
+  // The worker's *own* attempt when it named one; otherwise the op's intended id
+  // and whatever attempt the local ledger snapshot holds for it.
+  const intended =
+    ownInsert?.eventId ?? (op.kind === 'reschedule' ? op.fallbackEventId : op.eventId);
   if (intended === undefined) {
     return false;
   }
@@ -151,14 +173,15 @@ export function cleanupEligible(row: BookingRow, op: PendingOp): boolean {
     // The winner may yet adopt it.
     return false;
   }
-  const ownAttempt = op.attempts.find(
-    (attempt) => attempt.kind === 'insert' && attempt.eventId === intended,
-  );
-  if (ownAttempt === undefined) {
+  const attemptId =
+    ownInsert?.attemptId ??
+    op.attempts.find((attempt) => attempt.kind === 'insert' && attempt.eventId === intended)
+      ?.attemptId;
+  if (attemptId === undefined) {
     return false;
   }
   // Retired, and my attempt is still retained → mine to remove.
-  return row.unresolvedInserts.some((entry) => entry.attemptId === ownAttempt.attemptId);
+  return row.unresolvedInserts.some((entry) => entry.attemptId === attemptId);
 }
 
 /**
@@ -184,10 +207,17 @@ export async function cleanupOwnEvent(
     logLifecycle('event_reaped', { bookingId, eventId, attemptId });
     return { deleted: true };
   } catch (error) {
-    if (classifyCalendarError(error) !== 'precondition_failed') {
-      // A 404/410 here means a reaper already deleted the event and attributed
-      // it — the same `attemptId`, so retirement is a no-op either way.
-      await ctx.store.retireAttempt(bookingId, attemptId);
+    const klass = classifyCalendarError(error);
+    if (klass !== 'precondition_failed') {
+      // Retirement requires **proof** that the event is gone (C6.0/C6.3a): a
+      // 404/410 means a reaper already deleted it and attributed the same
+      // `attemptId`, so retiring is a no-op either way. A 403, a 429, a 5xx, or
+      // a network failure proves nothing — the event may still be on the host's
+      // calendar, and dropping its only cleanup reference would strand it
+      // there forever (LIVE-REVIEW-05). The entry stays listed for the reap.
+      if (klass === DEFINITE && isAbsenceStatus(error)) {
+        await ctx.store.retireAttempt(bookingId, attemptId);
+      }
       return { deleted: false };
     }
   }
@@ -220,7 +250,11 @@ export async function cleanupOwnEvent(
     await ctx.store.retireAttempt(bookingId, attemptId);
     logLifecycle('event_reaped', { bookingId, eventId, attemptId });
     return { deleted: true };
-  } catch {
+  } catch (error) {
+    // Same rule as the first delete: only proven absence retires the entry.
+    if (classifyCalendarError(error) === DEFINITE && isAbsenceStatus(error)) {
+      await ctx.store.retireAttempt(bookingId, attemptId);
+    }
     return { deleted: false };
   }
 }

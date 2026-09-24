@@ -1,4 +1,4 @@
-import { hasDatabase, getDatabase } from '@/lib/db/index';
+import { ensureDatabase } from '@/lib/db/index';
 import { healthOk, healthSchema, type DbState, type SchemaState } from '@/lib/db/health';
 import { resolveEnv } from '@/lib/env';
 
@@ -34,10 +34,18 @@ export async function GET() {
   let schema: SchemaState = 'n/a';
   let db: DbState = 'n/a';
 
-  if (env.store === 'pg' && hasDatabase()) {
-    const readiness = await healthSchema(getDatabase());
-    schema = readiness.schema;
-    db = readiness.db;
+  if (env.store === 'pg') {
+    // `DATABASE_URL` selected pg, so readiness is never skipped. A database
+    // that cannot even be initialized is `unreachable` / `unknown` → 503,
+    // rather than a green deploy the store would then refuse to serve.
+    try {
+      const readiness = await healthSchema(ensureDatabase());
+      schema = readiness.schema;
+      db = readiness.db;
+    } catch {
+      schema = 'unknown';
+      db = 'unreachable';
+    }
   }
 
   const ok = healthOk(schema);

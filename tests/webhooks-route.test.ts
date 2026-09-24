@@ -5,16 +5,18 @@ import path from 'node:path';
 import { beforeEach, describe, it } from 'node:test';
 import { POST as cancelPOST } from '../app/api/bookings/[id]/cancel/route';
 import { POST as reschedulePOST } from '../app/api/bookings/[id]/reschedule/route';
+import { setBookingCalendarProvider } from '../app/api/event-types/[slug]/bookings/route';
 import {
-  POST as createBookingPOST,
-  setBookingCalendarProvider,
-} from '../app/api/event-types/[slug]/bookings/route';
-import { createEventType, resetEventTypes } from '../lib/availability/event-type';
+  createEventType,
+  getEventTypeBySlug,
+  resetEventTypes,
+} from '../lib/availability/event-type';
 import {
   createAvailabilitySchedule,
   resetAvailabilitySchedules,
 } from '../lib/availability/schedule';
-import { resetBookings } from '../lib/booking/booking';
+import { bookAvailableSlot, resetBookings } from '../lib/booking/booking';
+import { getBookingCalendarProvider } from '../lib/booking/calendar-runtime';
 import { resetCalendarConnections } from '../lib/calendar/connection';
 import { createFixtureCalendarProvider } from '../lib/calendar/google-freebusy';
 import type { GoogleFreeBusyFixture } from '../lib/calendar/google-freebusy';
@@ -64,15 +66,26 @@ function seedEventType(slug = 'intro-30') {
   });
 }
 
-function createRequest(slug: string, body: unknown): Promise<Response> {
-  return createBookingPOST(
-    new Request(`http://localhost/api/event-types/${slug}/bookings`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    }),
-    { params: Promise.resolve({ slug }) },
-  );
+// The subject here is the webhook the **booking service** emits, which fires
+// from `bookAvailableSlot` itself. Creating the fixture booking through the
+// library keeps that subject intact now that the legacy HTTP route sends
+// `one_on_one` creates through the shared C6 lifecycle instead (C2).
+async function createRequest(
+  slug: string,
+  body: { start: string; invitee: { name: string; email: string } },
+): Promise<Response> {
+  const eventType = getEventTypeBySlug(slug);
+  if (!eventType) {
+    return Response.json({ error: 'event type not found' }, { status: 404 });
+  }
+  const booking = await bookAvailableSlot({
+    eventType,
+    start: body.start,
+    invitee: body.invitee,
+    provider: getBookingCalendarProvider(),
+    calendarId: 'primary',
+  });
+  return Response.json({ booking }, { status: 201 });
 }
 
 function rescheduleRequest(id: string, body: unknown): Promise<Response> {

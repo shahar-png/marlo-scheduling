@@ -22,9 +22,11 @@ export async function GET(
     );
   }
 
-  await ensureOwnerFixtures(ownerSlug);
-
   try {
+    // Inside the boundary: seeding resolves the runtime, and in pg mode that is
+    // where a missing driver or an unreachable database surfaces — as the
+    // mapped 503 `store_driver_unavailable`, never an untyped 500 (REV-07).
+    await ensureOwnerFixtures(ownerSlug);
     const { times } = await availableTimes({ ownerSlug, eventSlug, window });
     return Response.json({ times });
   } catch (error) {

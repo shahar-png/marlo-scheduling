@@ -293,12 +293,26 @@ function parseEvent(body: unknown, fallbackStart?: string, fallbackEnd?: string)
   const priv = privateOf(body);
   const start = dateTimeOf(body.start) ?? fallbackStart ?? '';
   const end = dateTimeOf(body.end) ?? fallbackEnd ?? '';
+  // A 2xx whose body does not identify an event is **malformed**, and C6.0
+  // classifies a malformed response as `ambiguous` — never as an applied
+  // mutation. Coercing the missing fields to `''` let a body like `{}` finalize
+  // a booking as `calendar_state='created'` with no verified event identity and
+  // no usable etag for any later `If-Match` (REVIEW-05).
+  if (typeof body.id !== 'string' || body.id === '') {
+    throw new CalendarError('ambiguous', null, 'event body carries no id');
+  }
+  if (typeof body.etag !== 'string' || body.etag === '') {
+    throw new CalendarError('ambiguous', null, 'event body carries no etag');
+  }
+  if (start === '' || end === '') {
+    throw new CalendarError('ambiguous', null, 'event body carries no bounds');
+  }
   const event: CalendarEvent = {
-    id: typeof body.id === 'string' ? body.id : '',
+    id: body.id,
     status: body.status === 'cancelled' ? 'cancelled' : 'confirmed',
     start,
     end,
-    etag: typeof body.etag === 'string' ? body.etag : '',
+    etag: body.etag,
   };
   if (typeof body.summary === 'string') {
     event.summary = body.summary;

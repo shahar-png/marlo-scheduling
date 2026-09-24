@@ -32,6 +32,10 @@ import { dispatchBookingNotification } from '../notify/dispatch';
 import type { EmailProvider } from '../notify/email';
 import { getBookingEmailProvider } from '../notify/email-runtime';
 import { deliverBookingWebhook } from '../webhooks/deliver';
+import type { CreateOutcome } from './create';
+import { hostOccupancy } from './occupancy';
+import { getRuntime } from './runtime';
+import { createLinkBooking } from './service';
 import {
   BOOKING_CANCELED as WEBHOOK_BOOKING_CANCELED,
   BOOKING_CREATED as WEBHOOK_BOOKING_CREATED,
@@ -391,7 +395,9 @@ export async function bookAvailableSlot(
 export async function listSingleUseAvailableTimes(
   input: ListSingleUseAvailableTimesInput,
 ): Promise<string[]> {
-  const resolved = resolveSingleUseTarget(input.token);
+  // A consumed link offers nothing, so the `GET` still refuses it up front
+  // (C10, unchanged wire status 410).
+  const resolved = resolveSingleUseTarget(input.token, { rejectConsumed: true });
   return listAvailableTimes({
     eventType: resolved.eventType,
     schedule: resolved.schedule,
@@ -400,27 +406,41 @@ export async function listSingleUseAvailableTimes(
     timeMax: input.timeMax,
     provider: input.provider,
     calendarId: input.calendarId,
-    extraBusy: hostBookingsAsBusy(resolved.eventType.hostId),
+    // C6.1 occupancy — the same reservations and confirmed intervals the
+    // owner-scoped surfaces see, not the legacy in-process booking map.
+    extraBusy: await hostOccupancy(getRuntime().store, resolved.eventType.hostId, {
+      start: input.timeMin,
+      end: input.timeMax,
+    }),
   });
 }
 
 export async function bookSingleUseLink(
   input: BookSingleUseLinkInput,
-): Promise<Booking> {
-  return withLock(tokenLocks, input.token, async () => {
-    const resolved = resolveSingleUseTarget(input.token);
-    const booking = await bookAvailableSlot({
-      eventType: resolved.eventType,
-      start: input.start,
-      invitee: input.invitee,
-      provider: input.provider,
-      calendarId: input.calendarId,
-      emailProvider: input.emailProvider,
-      oneOffMeeting: resolved.oneOffMeeting,
-    });
-    consumeSingleUseLink(input.token, booking.id);
-    return booking;
+): Promise<CreateOutcome> {
+  // No `tokenLocks` boundary any more: the shared create's per-host lock is the
+  // one that matters, and a token-scoped lock only ever hid the host-scoped race
+  // (C10). `provider` / `calendarId` / `emailProvider` are no longer consulted
+  // here either — the lifecycle owns calendar and email ordering.
+  const resolved = resolveSingleUseTarget(input.token, { rejectConsumed: false });
+  const outcome = await createLinkBooking({
+    token: input.token,
+    eventType: resolved.eventType,
+    schedule: resolved.schedule ?? null,
+    ...(resolved.oneOffMeeting === undefined
+      ? {}
+      : { oneOffMeeting: resolved.oneOffMeeting }),
+    start: input.start,
+    invitee: input.invitee,
+    onFinalize: (row) => {
+      consumeSingleUseLink(input.token, row.id);
+    },
   });
+  // A **replay** finalized on an earlier request, so T2 does not run again;
+  // consumption is idempotent for this booking, so repeating it here is the
+  // no-op that keeps a link consumed even if its first T2 crashed after commit.
+  consumeSingleUseLink(input.token, outcome.row.id);
+  return outcome;
 }
 
 export async function rescheduleBooking(
@@ -552,7 +572,17 @@ export async function cancelBooking(
   return cancelled;
 }
 
-function resolveSingleUseTarget(token: string): {
+/**
+ * C10 / REV3-09 — resolution is payload-blind, so it cannot decide a consumed
+ * link's fate. `GET available-times` still refuses one outright
+ * (`rejectConsumed: true`); `POST` does **not**, because whether a consumed
+ * link's request is a replay or a genuine reuse is answered downstream by the
+ * C9 fingerprint, not by the link's status.
+ */
+function resolveSingleUseTarget(
+  token: string,
+  options: { rejectConsumed: boolean },
+): {
   eventType: EventType;
   schedule?: AvailabilitySchedule;
   oneOffMeeting?: OneOffMeeting;
@@ -561,7 +591,7 @@ function resolveSingleUseTarget(token: string): {
   if (!link) {
     throw new BookingNotFoundError('single-use link not found');
   }
-  if (link.status === LINK_CONSUMED) {
+  if (options.rejectConsumed && link.status === LINK_CONSUMED) {
     throw new SingleUseLinkConsumedError();
   }
 
@@ -591,7 +621,12 @@ function resolveSingleUseTarget(token: string): {
   throw new BookingValidationError('single-use link has no target');
 }
 
-function eventTypeFromOneOff(meeting: OneOffMeeting): EventType {
+/**
+ * The synthetic event type a one-off meeting presents to the booking path. It
+ * is deliberately **not** in the event-type registry, which is the case the
+ * confirmation page's host/event fallbacks exist for.
+ */
+export function eventTypeFromOneOff(meeting: OneOffMeeting): EventType {
   return {
     id: meeting.id,
     // One-off meetings are demo-owner fixtures (C10: never durable records).

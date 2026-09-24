@@ -104,6 +104,14 @@ export class MemoryBookingStore implements BookingStore {
     return id === undefined ? null : this.getById(id);
   }
 
+  /**
+   * Every row, for the suite-wide invariant sweeps (CF-1..CF-3, AC-11/AC-23).
+   * The pg side reads the fake's table directly; this is its counterpart.
+   */
+  allRows(): BookingRow[] {
+    return [...this.rows.values()].map(cloneRow);
+  }
+
   async occupancy(query: OccupancyQuery): Promise<Interval[]> {
     return this.occupancySync(query);
   }
@@ -285,6 +293,23 @@ class MemoryTx implements BookingTx {
       write();
     }
     this.writes.length = 0;
+  }
+
+  /**
+   * The memory store has no aborted-transaction state, so the savepoint is the
+   * deferred-write list itself: a failed attempt discards only the writes it
+   * queued, and the transaction stays usable (REVIEW-01).
+   */
+  async attempt<T>(
+    fn: () => Promise<T>,
+  ): Promise<{ ok: true; value: T } | { ok: false; error: unknown }> {
+    const mark = this.writes.length;
+    try {
+      return { ok: true, value: await fn() };
+    } catch (error) {
+      this.writes.length = mark;
+      return { ok: false, error };
+    }
   }
 
   async lookupKey(ownerId: string, idempotencyKey: string): Promise<BookingRow | null> {
@@ -505,6 +530,21 @@ class MemoryTx implements BookingTx {
     inspectedAt: string,
   ): Promise<number[]> {
     return this.store.stampReapBatch(id, eventIds, inspectedAt);
+  }
+
+  /**
+   * C5 — the claim, issued inside this locked transaction. The memory store's
+   * per-host mutex is the serialization boundary, so delegating to the store's
+   * own claim here is atomic with the `selectForUpdate` that validated the pair.
+   */
+  async claimDelivery(input: {
+    bookingId: string;
+    revision: number;
+    action: DeliveryAction;
+    recipient: DeliveryRecipient;
+    nowMs: number;
+  }): Promise<LedgerClaim> {
+    return this.store.claimDelivery(input);
   }
 
   async retireAttempt(id: string, attemptId: string): Promise<void> {

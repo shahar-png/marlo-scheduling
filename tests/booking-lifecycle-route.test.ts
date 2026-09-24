@@ -3,24 +3,27 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { beforeEach, describe, it } from 'node:test';
 import { GET as availableTimesGET } from '../app/api/event-types/[slug]/available-times/route';
-import {
-  POST as createBookingPOST,
-  setBookingCalendarProvider,
-} from '../app/api/event-types/[slug]/bookings/route';
+import { setBookingCalendarProvider } from '../app/api/event-types/[slug]/bookings/route';
 import { POST as cancelPOST } from '../app/api/bookings/[id]/cancel/route';
 import { POST as reschedulePOST } from '../app/api/bookings/[id]/reschedule/route';
 import { GET as healthGET } from '../app/api/health/route';
 import { isAuthorizedForPath } from '../lib/auth/host-guard';
-import { createEventType, resetEventTypes } from '../lib/availability/event-type';
+import {
+  createEventType,
+  getEventTypeBySlug,
+  resetEventTypes,
+} from '../lib/availability/event-type';
 import {
   createAvailabilitySchedule,
   resetAvailabilitySchedules,
 } from '../lib/availability/schedule';
 import {
+  bookAvailableSlot,
   getBooking,
   listConfirmedBookingsForHost,
   resetBookings,
 } from '../lib/booking/booking';
+import { getBookingCalendarProvider } from '../lib/booking/calendar-runtime';
 import { resetReminderJobs } from '../lib/booking/reminders';
 import { resetCalendarConnections } from '../lib/calendar/connection';
 import { createFixtureCalendarProvider } from '../lib/calendar/google-freebusy';
@@ -53,18 +56,30 @@ function seedIntro30() {
   });
 }
 
-function createRequest(
+// The subject here is the retained legacy reschedule/cancel handlers, which
+// operate on a legacy row. Creating that row through the library keeps the
+// subject intact now that the legacy HTTP create sends `one_on_one` through the
+// shared C6 lifecycle instead (C2).
+async function createRequest(
   slug: string,
-  body: unknown,
+  body: { start: string; invitee: { name: string; email: string } },
 ): Promise<Response> {
-  return createBookingPOST(
-    new Request(`http://localhost/api/event-types/${slug}/bookings`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    }),
-    { params: Promise.resolve({ slug }) },
-  );
+  const eventType = getEventTypeBySlug(slug);
+  if (!eventType) {
+    return Response.json({ error: 'event type not found' }, { status: 404 });
+  }
+  try {
+    const booking = await bookAvailableSlot({
+      eventType,
+      start: body.start,
+      invitee: body.invitee,
+      provider: getBookingCalendarProvider(),
+      calendarId: 'primary',
+    });
+    return Response.json({ booking }, { status: 201 });
+  } catch {
+    return Response.json({ error: 'conflict' }, { status: 409 });
+  }
 }
 
 function rescheduleRequest(id: string, body: unknown): Promise<Response> {
@@ -159,13 +174,18 @@ describe('AC-5 invitee cancel + public lifecycle routes', () => {
     });
     assert.equal(emptyReason.status, 400);
 
+    // C11 — an id that resolves to nothing is authenticated exactly like one
+    // that does, so an unauthenticated call is 401 `token_required` whether or
+    // not a booking exists under it. Answering 404 here (and 401 for a real
+    // durable id) was a booking-existence oracle (REV-08).
     const missing = await cancelRequest('nope', { reason: 'changed plans' });
-    assert.equal(missing.status, 404);
+    assert.equal(missing.status, 401);
+    assert.equal(((await missing.json()) as { error: string }).error, 'token_required');
 
     const unknownReschedule = await rescheduleRequest('nope', {
       start: SLOT_0930,
     });
-    assert.equal(unknownReschedule.status, 404);
+    assert.equal(unknownReschedule.status, 401);
 
     const moved = await rescheduleRequest(createdBody.booking.id, {
       start: SLOT_0930,

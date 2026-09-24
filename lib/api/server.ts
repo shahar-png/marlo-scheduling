@@ -3,7 +3,9 @@ import { getBooking } from '../booking/booking';
 import { hostMetaForHostId } from '../demo/seed';
 import { mapBooking } from './client';
 import { publicBookingPath } from './public-path';
-import type { PublicBookingResult } from './types';
+import { getRuntime } from '../booking/runtime';
+import { readBooking, scopeForRow } from '../booking/service';
+import type { ConfirmedPublicBooking, PublicBookingResult } from './types';
 
 // Server-side helper for the confirmation shell: reads the existing in-memory
 // booking row directly (no HTTP round trip from a Server Component to itself).
@@ -26,6 +28,55 @@ import type { PublicBookingResult } from './types';
 // type that is never inserted into the store (no href); a store-backed slug
 // the constructor rejects (`intro#follow-up`) yields none either — never a
 // guessed `/one-off-…` path, the raw id, `#`, or a misparsed slug.
+/**
+ * C11 — the durable `/b/{token}` lookup.
+ *
+ * The page passes its path segment straight through to `getByToken`, which
+ * reads the `token` column; a booking **id** in the `/b/` path therefore finds
+ * nothing and renders the not-found shell, because the id alone grants nothing.
+ *
+ * Returns `null` when no durable row carries this token, so the caller can fall
+ * back to the retained fixture adapter below (C10 / C6.9 keep those rows
+ * outside the C6 contract).
+ */
+export async function getDurableBookingByToken(
+  token: string,
+): Promise<ConfirmedPublicBooking | null> {
+  const trimmed = token.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const runtime = getRuntime();
+  const row = await runtime.store.getByToken(trimmed);
+  if (row === null) {
+    return null;
+  }
+  // A read is one of the designated observing calls for the C6.3a reap, and it
+  // is the only place the envelope's `pending` calendar state can surface.
+  const scope = await scopeForRow(row, runtime);
+  const envelope = await readBooking(scope);
+  const href = publicBookingPath(scope.owner.slug, scope.eventType.slug);
+  return {
+    kind: 'booking',
+    id: envelope.booking.id,
+    token: envelope.booking.token,
+    start: envelope.booking.start,
+    end: envelope.booking.end,
+    status: envelope.booking.status,
+    eventTypeId: envelope.booking.eventTypeId,
+    invitee: envelope.booking.invitee,
+    ownerSlug: envelope.booking.ownerSlug,
+    eventSlug: envelope.booking.eventSlug,
+    revision: envelope.booking.revision,
+    hostFirstName: envelope.booking.hostFirstName,
+    delivery: {
+      email: envelope.delivery.email,
+      calendar: envelope.delivery.calendar,
+    },
+    ...(href ? { bookAgainHref: href } : {}),
+  };
+}
+
 export function getBookingByToken(token: string): PublicBookingResult {
   const trimmed = token.trim();
   if (!trimmed) {

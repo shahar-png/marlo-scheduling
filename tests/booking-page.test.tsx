@@ -27,7 +27,15 @@ import {
   createAvailabilitySchedule,
   resetAvailabilitySchedules,
 } from '../lib/availability/schedule';
+// `listConfirmedBookingsForHost` reads the retained fixture store, which is
+// still where a `group` booking lands (C6.9); `one_on_one` rows are durable.
 import { listConfirmedBookingsForHost, resetBookings } from '../lib/booking/booking';
+import type { MemoryBookingStore } from '../lib/booking/memory-store';
+import {
+  memoryRuntimeHandle,
+  resetRuntime,
+  setRuntimeOverride,
+} from '../lib/booking/runtime';
 import { resetCalendarConnections } from '../lib/calendar/connection';
 import { createFixtureCalendarProvider } from '../lib/calendar/google-freebusy';
 import type { GoogleFreeBusyFixture } from '../lib/calendar/google-freebusy';
@@ -75,6 +83,8 @@ type HarnessOptions = {
   // transport) so the outgoing backend query (clamped / widened) is visible
   // in `backendCalls` while `getSlotsCalls` still records the form's request.
   viaAdapter?: boolean;
+  /** C9 — supplied by the cases that drive the real create handler. */
+  newKey?: () => string;
 };
 
 function harness(options: HarnessOptions) {
@@ -115,7 +125,7 @@ function harness(options: HarnessOptions) {
       if (options.createBooking) {
         return options.createBooking(input);
       }
-      return { ok: true, booking: { token: 'tok-1', start: input.start, end: '', status: 'confirmed', eventTypeId: 'et-1', invitee: input.invitee } };
+      return { ok: true, booking: { id: 'bk-1', token: 'tok-1', start: input.start, end: '', status: 'confirmed', eventTypeId: 'et-1', invitee: input.invitee } };
     },
   };
   const schedule: Scheduler = {
@@ -138,6 +148,9 @@ function harness(options: HarnessOptions) {
     },
     now,
     schedule,
+    // C9: the shipped form always mints a key; the tests that exercise the real
+    // handlers need one for the same reason production does.
+    ...(options.newKey === undefined ? {} : { newKey: options.newKey }),
   });
 
   function render(activeStore: BookingFormStore = store): string {
@@ -293,9 +306,15 @@ describe('AC-4 real form interaction (BookingForm rendered directly, in-memory a
       resetBookings();
       resetCalendarConnections();
       setBookingCalendarProvider(null);
+      // A `one_on_one` create runs the shared C6 lifecycle, which reads the
+      // runtime clock and holds slots durably (C2).
+      resetRuntime();
+      setRuntimeOverride({
+        clock: { now: () => Date.parse('2026-09-20T08:00:00.000Z'), sleep: async () => {} },
+      });
     });
 
-    it('creates one booking row on the existing service and navigates to /b/{id}', async () => {
+    it('creates one durable booking row and navigates to /b/{token}', async () => {
       seedIntro30();
       setBookingCalendarProvider(createFixtureCalendarProvider(FIXTURE));
       const real = createApiClient({ transport: createHandlerTransport() });
@@ -303,16 +322,22 @@ describe('AC-4 real form interaction (BookingForm rendered directly, in-memory a
         now: '2026-09-20T08:00:00.000Z',
         getSlots: (input) => real.getSlots(input),
         createBooking: (input) => real.createBooking(input),
+        newKey: () => crypto.randomUUID(),
       });
       await h.store.load();
       assert.ok(offers(h.render(), '2026-09-20T09:00:00.000Z'));
       fillDetails(h.store, '2026-09-20T09:00:00.000Z');
       await h.store.submit();
 
-      const rows = listConfirmedBookingsForHost('host-1');
+      const rows = (memoryRuntimeHandle().store as MemoryBookingStore)
+        .allRows()
+        .filter((row) => row.status === 'confirmed');
       assert.equal(rows.length, 1);
-      assert.deepEqual(rows[0].invitee, { name: 'Ada Lovelace', email: 'ada@example.com' });
-      assert.deepEqual(h.navigations, [`/b/${rows[0].id}`]);
+      assert.equal(rows[0].inviteeName, 'Ada Lovelace');
+      assert.equal(rows[0].inviteeEmail, 'ada@example.com');
+      // C11: the confirmation navigation carries the token, never the id.
+      assert.deepEqual(h.navigations, [`/b/${rows[0].token}`]);
+      assert.notEqual(rows[0].token, rows[0].id);
     });
   });
 
@@ -456,7 +481,7 @@ describe('BOOK-FE-08 in-flight submit guard (deferred response)', () => {
 
     gate.resolve({
       ok: true,
-      booking: { token: 'tok-9', start: T_1000, end: '', status: 'confirmed', eventTypeId: 'et-1', invitee: { name: 'Ada Lovelace', email: 'ada@example.com' } },
+      booking: { id: 'bk-9', token: 'tok-9', start: T_1000, end: '', status: 'confirmed', eventTypeId: 'et-1', invitee: { name: 'Ada Lovelace', email: 'ada@example.com' } },
     });
     await Promise.all([first, second, third]);
 
@@ -557,7 +582,7 @@ describe('BOOK-FE-08 in-flight submit guard (deferred response)', () => {
     assert.equal(h.createCalls[1].start, T_1030);
     gate.resolve({
       ok: true,
-      booking: { token: 'tok-2', start: T_1030, end: '', status: 'confirmed', eventTypeId: 'et-1', invitee: { name: 'Ada Lovelace', email: 'ada@example.com' } },
+      booking: { id: 'bk-2', token: 'tok-2', start: T_1030, end: '', status: 'confirmed', eventTypeId: 'et-1', invitee: { name: 'Ada Lovelace', email: 'ada@example.com' } },
     });
     await again;
     assert.deepEqual(h.navigations, ['/b/tok-2']);
@@ -955,6 +980,10 @@ describe('BOOK-FE-10/13 email syntax gate through the real submit handler', () =
       resetBookings();
       resetCalendarConnections();
       setBookingCalendarProvider(null);
+      resetRuntime();
+      setRuntimeOverride({
+        clock: { now: () => Date.parse('2026-09-20T08:00:00.000Z'), sleep: async () => {} },
+      });
     });
 
     it('no booking row after the invalid submits, one after the corrected one', async () => {
@@ -965,22 +994,27 @@ describe('BOOK-FE-10/13 email syntax gate through the real submit handler', () =
         now: '2026-09-20T08:00:00.000Z',
         getSlots: (input) => real.getSlots(input),
         createBooking: (input) => real.createBooking(input),
+        newKey: () => crypto.randomUUID(),
       });
+      const durable = () =>
+        (memoryRuntimeHandle().store as MemoryBookingStore)
+          .allRows()
+          .filter((row) => row.status === 'confirmed');
       await h.store.load();
       h.store.selectSlot('2026-09-20T09:00:00.000Z');
       h.store.setName('Ada Lovelace');
       for (const email of ['@', 'a@b..co', 'a@b.co.']) {
         h.store.setEmail(email);
         await h.store.submit();
-        assert.equal(listConfirmedBookingsForHost('host-1').length, 0);
+        assert.equal(durable().length, 0);
         assert.equal(h.createCalls.length, 0);
       }
       h.store.setEmail('a@b.co');
       await h.store.submit();
-      const rows = listConfirmedBookingsForHost('host-1');
+      const rows = durable();
       assert.equal(rows.length, 1);
-      assert.equal(rows[0].invitee.email, 'a@b.co');
-      assert.deepEqual(h.navigations, [`/b/${rows[0].id}`]);
+      assert.equal(rows[0].inviteeEmail, 'a@b.co');
+      assert.deepEqual(h.navigations, [`/b/${rows[0].token}`]);
     });
   });
 });

@@ -5,9 +5,11 @@ import type { Database } from './db/index';
 import {
   assertAssignableOwnerSlug,
   OwnerSlugTakenError,
+  type EventTypeRecord,
   type HostToken,
   type Owner,
   type OwnerStore,
+  type ScheduleRecord,
 } from './owners';
 
 export const UPSERT_OWNER_SQL = `INSERT INTO owners (id, slug, first_name, email, calendar_id)
@@ -88,7 +90,45 @@ export class PgOwnerStore implements OwnerStore {
       updatedAt: String(row.updated_at),
     };
   }
+
+  /**
+   * C1 — the durable half of materialization. `pgCatalogSource` reads these two
+   * tables, so a newly signed-in owner's `intro-30` resolves in a fresh isolate
+   * only because sign-in wrote them here.
+   */
+  async upsertSchedule(schedule: ScheduleRecord): Promise<void> {
+    await this.db.query(UPSERT_SCHEDULE_SQL, [
+      schedule.id,
+      schedule.ownerId,
+      schedule.timezone,
+      JSON.stringify(schedule.windows),
+    ]);
+  }
+
+  async upsertEventType(eventType: EventTypeRecord): Promise<void> {
+    // Product bar lock: only `one_on_one` is ever seeded or materialized (C6.9).
+    await this.db.query(UPSERT_EVENT_TYPE_SQL, [
+      eventType.id,
+      eventType.ownerId,
+      eventType.slug,
+      eventType.durationMinutes,
+      eventType.notificationMode,
+      eventType.scheduleId,
+      eventType.name,
+    ]);
+  }
 }
+
+export const UPSERT_SCHEDULE_SQL = `INSERT INTO availability_schedules (id, owner_id, timezone, rules)
+  VALUES ($1, $2, $3, $4::jsonb)
+  ON CONFLICT (id) DO UPDATE
+    SET owner_id = $2, timezone = $3, rules = $4::jsonb`;
+
+export const UPSERT_EVENT_TYPE_SQL = `INSERT INTO event_types
+    (id, owner_id, slug, kind, duration_min, capacity, notification_mode, schedule_id, name)
+  VALUES ($1, $2, $3, 'one_on_one', $4, NULL, $5, $6, $7)
+  ON CONFLICT (id) DO UPDATE
+    SET slug = $3, duration_min = $4, notification_mode = $5, schedule_id = $6, name = $7`;
 
 function mapOwner(raw: Record<string, unknown>): Owner {
   return {

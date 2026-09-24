@@ -32,7 +32,8 @@ import {
   type LatestAction,
 } from '../booking/rows';
 import type { LifecycleContext } from '../booking/ops';
-import type { DeliveryAction } from '../booking/store';
+import type { DeliveryAction, DeliveryRecipient } from '../booking/store';
+import { REQUIRED_RECIPIENTS } from './ledger';
 
 export type NotifyRequestBody = {
   action?: unknown;
@@ -73,9 +74,16 @@ export type NotifyPhases = {
   resumeCreate: (row: BookingRow) => Promise<BookingRow>;
   /** N-2 repair input. */
   repair: { eventName: string; invitee: { name: string; email: string } };
-  /** N-3: claims and sends for `(revision, action)`. */
-  send: (row: BookingRow, action: DeliveryAction) => Promise<void>;
+  /** N-3: sends the claims N-3 acquired under the lock. Never claims itself. */
+  send: (
+    row: BookingRow,
+    action: DeliveryAction,
+    claims: RecipientClaim[],
+  ) => Promise<void>;
 };
+
+/** One acquired claim: the recipient and the generation every finalise carries. */
+export type RecipientClaim = { recipient: DeliveryRecipient; gen: number };
 
 export type NotifyResult = {
   row: BookingRow;
@@ -127,25 +135,55 @@ export async function runNotify(
   }
 
   // ---- N-3 notification claim -------------------------------------------
-  if (row.latestAction === null) {
-    // Defensive: CF-2 (`pending_op IS NULL ⇒ latest_action IS NOT NULL`)
-    // together with N-1 makes this unreachable on any committed row.
-    logLifecycle('notify_no_pair', { bookingId: row.id, revision: row.revision });
-    throw new StaleRevisionError(row.revision, null);
-  }
-
-  const action: LatestAction = row.latestAction;
-  if (request.form === 'revision') {
-    if (row.revision !== request.expectedRevision || action !== request.action) {
-      // A send for an older pair is refused BEFORE claiming, so a late
-      // confirmation can never mark a reschedule/cancel delivery `sent`.
-      throw new StaleRevisionError(row.revision, action);
+  //
+  // The validation and the claim happen in ONE host-locked transaction, under
+  // the booking's `FOR UPDATE` read (C5). Validating against an unlocked
+  // snapshot would let a cancel commit in between and a fresh claim be acquired
+  // for a pair that is already superseded — which is a different thing from the
+  // accepted case of an *already-claimed* send arriving late (REV5-05).
+  const claimed = await ctx.store.withHostLock(row.hostId, async (tx) => {
+    const locked = await tx.selectForUpdate(bookingId);
+    if (locked === null) {
+      throw new OperationInProgressError(1);
     }
-  }
+    if (locked.latestAction === null) {
+      // Defensive: CF-2 (`pending_op IS NULL ⇒ latest_action IS NOT NULL`)
+      // together with N-1 makes this unreachable on any committed row.
+      logLifecycle('notify_no_pair', { bookingId: locked.id, revision: locked.revision });
+      throw new StaleRevisionError(locked.revision, null);
+    }
+    const action: LatestAction = locked.latestAction;
+    if (request.form === 'revision') {
+      if (locked.revision !== request.expectedRevision || action !== request.action) {
+        // A send for an older pair is refused BEFORE claiming, so a late
+        // confirmation can never mark a reschedule/cancel delivery `sent`.
+        throw new StaleRevisionError(locked.revision, action);
+      }
+    }
 
-  await phases.send(row, action);
+    const claims: RecipientClaim[] = [];
+    for (const recipient of REQUIRED_RECIPIENTS) {
+      const acquired = await tx.claimDelivery({
+        bookingId: locked.id,
+        revision: locked.revision,
+        action,
+        recipient,
+        nowMs: ctx.clock.now(),
+      });
+      if (acquired !== null) {
+        claims.push({ recipient, gen: acquired.gen });
+      }
+    }
+    return { row: locked, action, claims };
+  });
+
+  // Only now, with the claim transaction committed, does anything reach Gmail.
+  await phases.send(claimed.row, claimed.action, claimed.claims);
   const fresh = await requireRow(ctx, bookingId);
-  return { row: fresh, retried: { revision: row.revision, action } };
+  return {
+    row: fresh,
+    retried: { revision: claimed.row.revision, action: claimed.action },
+  };
 }
 
 async function requireRow(ctx: LifecycleContext, bookingId: string): Promise<BookingRow> {

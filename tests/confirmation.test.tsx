@@ -19,13 +19,13 @@ import {
   createAvailabilitySchedule,
   resetAvailabilitySchedules,
 } from '../lib/availability/schedule';
-import { createSingleUseLink, resetSingleUseLinks } from '../lib/availability/single-use-link';
+import { resetSingleUseLinks } from '../lib/availability/single-use-link';
 import {
   BOOKING_CANCELLED,
   BOOKING_CONFIRMED,
   bookAvailableSlot,
-  bookSingleUseLink,
   cancelBooking,
+  eventTypeFromOneOff,
   getBooking,
   resetBookings,
 } from '../lib/booking/booking';
@@ -278,10 +278,15 @@ describe('AC-5 confirmation route /b/{token}', () => {
     const body = (await response.json()) as { booking: { id: string } };
     assert.equal(body.booking.id, booking.id);
 
+    // C11 — an id that resolves to nothing is authenticated like any other, so
+    // the unauthenticated read is 401 `token_required` rather than a 404 that
+    // would reveal the booking does not exist (REV-08). The fixture row above
+    // is still served unauthenticated, because it really is a fixture row.
     const missing = await bookingGET(new Request('http://localhost/api/bookings/nope'), {
       params: Promise.resolve({ id: 'nope' }),
     });
-    assert.equal(missing.status, 404);
+    assert.equal(missing.status, 401);
+    assert.equal(((await missing.json()) as { error: string }).error, 'token_required');
   });
 
   it('(b) BOOK-FE-11 cancelled through the existing cancelBooking: cancel.done + bookAgain link, nothing active', async () => {
@@ -333,16 +338,20 @@ describe('AC-5 confirmation route /b/{token}', () => {
     assert.match(html, /<h1 class="marlo-display marlo-display--hero">/);
   });
 
-  it("(b′) BOOK-FE-14 cancelled one-off booking (bookSingleUseLink): cancellation shell, no bookAgain link, no invented href", async () => {
+  it("(b′) BOOK-FE-14 cancelled one-off booking (synthetic one-off event type): cancellation shell, no bookAgain link, no invented href", async () => {
     const meeting = seedOffsite();
-    const link = createSingleUseLink({ oneOffMeetingId: meeting.id, token: 'use-once' });
     const provider = createFixtureCalendarProvider(FIXTURE);
-    const booking = await bookSingleUseLink({
-      token: link.token,
+    // The subject here is the confirmation page's fallback for a booking whose
+    // event type is absent from the registry — the shape a one-off produces.
+    // (C10 routes the *link* itself through the durable create path, whose rows
+    // this legacy renderer does not read.)
+    const booking = await bookAvailableSlot({
+      eventType: eventTypeFromOneOff(meeting),
       start: SLOT_0900,
       invitee: { name: 'Ada Lovelace', email: 'ada@example.com' },
       provider,
       calendarId: 'primary',
+      oneOffMeeting: meeting,
     });
     // Precondition the fallback exists for: the synthetic one-off event type
     // is not in the store. If this ever fails, the fallback is unreachable.
@@ -375,13 +384,13 @@ describe('AC-5 confirmation route /b/{token}', () => {
 
   it('a confirmed one-off booking still renders the active layout without an event-type lookup', async () => {
     const meeting = seedOffsite();
-    const link = createSingleUseLink({ oneOffMeetingId: meeting.id, token: 'use-once' });
-    const booking = await bookSingleUseLink({
-      token: link.token,
+    const booking = await bookAvailableSlot({
+      eventType: eventTypeFromOneOff(meeting),
       start: SLOT_0900,
       invitee: { name: 'Ada Lovelace', email: 'ada@example.com' },
       provider: createFixtureCalendarProvider(FIXTURE),
       calendarId: 'primary',
+      oneOffMeeting: meeting,
     });
     assert.equal(getEventType(booking.eventTypeId), null);
     const row = getBookingByToken(booking.id);
@@ -488,13 +497,13 @@ describe('AC-5 confirmation route /b/{token}', () => {
 
     // (b′) cancelled one-off row — host resolved, event type not
     const meeting = seedOffsite();
-    const link = createSingleUseLink({ oneOffMeetingId: meeting.id, token: 'use-once' });
-    const oneOff = await bookSingleUseLink({
-      token: link.token,
+    const oneOff = await bookAvailableSlot({
+      eventType: eventTypeFromOneOff(meeting),
       start: '2026-09-20T11:00:00.000Z',
       invitee: { name: 'Ada Lovelace', email: 'ada@example.com' },
       provider,
       calendarId: 'primary',
+      oneOffMeeting: meeting,
     });
     await cancelBooking({ bookingId: oneOff.id, reason: 'x', provider, calendarId: 'primary' });
     const bPrime = getBookingByToken(oneOff.id);
@@ -573,21 +582,38 @@ describe('AC-5 confirmation route /b/{token}', () => {
       'utf8',
     );
     assert.equal(source.split('cancel.bookAgain').length - 1, 1);
-    // The cancelled branch is a separate function; slice it out by name.
+    // The retained fixture branch is a separate function; slice it out by name.
     const start = source.indexOf('function CancelledPanel');
     assert.ok(start > 0);
     const end = source.indexOf('\nfunction ', start + 1);
     assert.ok(end > start);
     const cancelledBranch = source.slice(start, end);
-    const outside = source.slice(0, start) + source.slice(end);
     assert.ok(cancelledBranch.includes('bookAgainHref'));
     assert.ok(cancelledBranch.includes('cancel.bookAgain'));
-    assert.equal(outside.includes('bookAgainHref'), false);
-    assert.equal(outside.includes('cancel.bookAgain'), false);
     // The confirmed branch does not reference the field.
     const confirmedStart = source.indexOf('function ConfirmedPanel');
     const confirmedEnd = source.indexOf('\nfunction ', confirmedStart + 1);
     assert.equal(source.slice(confirmedStart, confirmedEnd).includes('bookAgainHref'), false);
+
+    // A durable row renders its panels from `BookingControls`, so the same
+    // anchor-by-branch rule is asserted there: exactly one occurrence, and only
+    // inside the cancelled branch.
+    const controls = readFileSync(
+      path.join(ROOT, 'app/(public)/b/[token]/BookingControls.tsx'),
+      'utf8',
+    );
+    assert.equal(controls.split('cancel.bookAgain').length - 1, 1);
+    const cancelledStart = controls.indexOf('data-panel="cancelled"');
+    const confirmedPanelStart = controls.indexOf('data-panel="confirmed"');
+    assert.ok(cancelledStart > 0 && confirmedPanelStart > cancelledStart);
+    const cancelledRegion = controls.slice(cancelledStart, confirmedPanelStart);
+    assert.ok(cancelledRegion.includes('cancel.bookAgain'));
+    assert.ok(cancelledRegion.includes('bookAgainHref'));
+    assert.equal(
+      controls.slice(confirmedPanelStart).includes('bookAgainHref'),
+      false,
+      'the confirmed branch never renders the book-again anchor',
+    );
   });
 
   it('(f)(iv) BOOK-FE-17 source: the adapter module has no demo-name fallback', () => {

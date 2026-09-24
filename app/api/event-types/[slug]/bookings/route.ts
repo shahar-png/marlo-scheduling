@@ -3,18 +3,20 @@ import {
   ownersOfSlug,
   resolveEventType,
 } from '@/lib/availability/event-type';
-import {
-  bookAvailableSlot,
-  BookingConflictError,
-  BookingNotFoundError,
-  BookingValidationError,
-} from '@/lib/booking/booking';
-import {
-  getBookingCalendarProvider,
-  setBookingCalendarProvider,
-} from '@/lib/booking/calendar-runtime';
-import { getHostCalendarConnection } from '@/lib/calendar/connection';
+import { assertLiveKind, isFixtureOnlyKind } from '@/lib/catalog';
+import { setBookingCalendarProvider } from '@/lib/booking/calendar-runtime';
+import { fixtureCreateResponse } from '@/lib/booking/fixture-create';
+import { ensureOwnerFixtures } from '@/lib/booking/fixtures';
+import { createBooking } from '@/lib/booking/service';
 import { DEMO_EVENT_SLUG, ensureDemoFixtures } from '@/lib/demo/seed';
+import { resolveEnv } from '@/lib/env';
+import {
+  errorResponse,
+  idempotencyKeyOf,
+  originOf,
+  readJsonBody,
+} from '@/lib/api/route-helpers';
+import { DEMO_OWNER_SLUG } from '@/lib/owners-materialize';
 
 export { setBookingCalendarProvider };
 
@@ -22,10 +24,22 @@ export { setBookingCalendarProvider };
 // `slug` resolves **only** within the `demo` owner; a slug owned by someone else
 // is 404 `owner_required`.
 //
-// The C6.9 kinds (`group`, `collective`) keep their existing memory-mode fixture
-// path here with no key, no fingerprint, and no C9 record — the exemption that
-// keeps `tests/group-route.test.ts` and `tests/collective-route.test.ts` passing
-// byte-for-byte unmodified (REV15-03).
+// The order is the same one every create entry point uses (REV15-03):
+//
+//   1. read-only catalog resolution;
+//   2. the C6.9 kind gate — 501 in pg/live mode, before any side effect;
+//   3. the C2/C9 `Idempotency-Key` check, which a resolved `group`/`collective`
+//      kind therefore never reaches;
+//   4. the lifecycle.
+//
+// A `one_on_one` create runs the **shared demo-scoped lifecycle** — the same
+// host lock, reservation-aware occupancy, two-phase create, and id/token model
+// as the owner-scoped route — so it can neither double-book against a durable
+// row nor mint a row that is readable without its bearer token. Only `group`
+// and `collective` keep their existing memory-mode fixture path, with no key,
+// no fingerprint, and no C9 record (C6.9).
+
+export const dynamic = 'force-dynamic';
 
 type BookingBody = {
   start?: unknown;
@@ -33,6 +47,7 @@ type BookingBody = {
     name?: unknown;
     email?: unknown;
   };
+  notes?: unknown;
 };
 
 export async function POST(
@@ -41,10 +56,8 @@ export async function POST(
 ) {
   const { slug } = await context.params;
 
-  let body: BookingBody;
-  try {
-    body = (await request.json()) as BookingBody;
-  } catch {
+  const body = await readJsonBody<BookingBody>(request);
+  if (body === null) {
     return Response.json({ error: 'invalid json body' }, { status: 400 });
   }
 
@@ -65,6 +78,7 @@ export async function POST(
     ensureDemoFixtures();
   }
 
+  // (1) Read-only catalog resolution, within the demo owner only.
   const eventType = resolveEventType(DEMO_OWNER_ID, slug);
   if (!eventType) {
     const owners = ownersOfSlug(slug);
@@ -74,28 +88,48 @@ export async function POST(
     return Response.json({ error: 'event type not found' }, { status: 404 });
   }
 
-  const connection = getHostCalendarConnection(eventType.hostId);
-  const calendarId = connection?.destinationCalendarId ?? 'primary';
-
+  // (2) The C6.9 kind gate, before any lock, write, calendar call, or email.
   try {
-    const booking = await bookAvailableSlot({
+    assertLiveKind(eventType.kind, resolveEnv().store === 'pg');
+  } catch (error) {
+    const mapped = errorResponse(error);
+    if (mapped !== null) {
+      return mapped;
+    }
+    throw error;
+  }
+
+  // (3)/(4) A fixture kind keeps its existing path — the exemption that keeps
+  // `tests/group-route.test.ts` and `tests/collective-route.test.ts` passing
+  // byte-for-byte unmodified (REV15-03). Everything else is a real booking.
+  if (isFixtureOnlyKind(eventType.kind)) {
+    return fixtureCreateResponse({
       eventType,
       start,
       invitee: { name, email },
-      provider: getBookingCalendarProvider(),
-      calendarId,
     });
-    return Response.json({ booking }, { status: 201 });
+  }
+
+  try {
+    // Inside the boundary: seeding resolves the runtime, and in pg mode that is
+    // where a missing driver or an unreachable database surfaces (REV-07).
+    await ensureOwnerFixtures(DEMO_OWNER_SLUG);
+    const outcome = await createBooking({
+      ownerSlug: DEMO_OWNER_SLUG,
+      eventSlug: slug,
+      start,
+      invitee: { name, email },
+      notes: typeof body.notes === 'string' ? body.notes : null,
+      idempotencyKey: idempotencyKeyOf(request),
+      origin: originOf(request),
+    });
+    return Response.json(outcome.envelope, { status: 201 });
   } catch (error) {
-    if (error instanceof BookingValidationError) {
-      return Response.json({ error: error.message }, { status: 400 });
-    }
-    if (error instanceof BookingNotFoundError) {
-      return Response.json({ error: error.message }, { status: 404 });
-    }
-    if (error instanceof BookingConflictError) {
-      return Response.json({ error: error.message }, { status: 409 });
+    const mapped = errorResponse(error);
+    if (mapped !== null) {
+      return mapped;
     }
     throw error;
   }
 }
+

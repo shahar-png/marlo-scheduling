@@ -76,6 +76,43 @@ export async function selectBatch(
 }
 
 /**
+ * The C7 variant of `selectBatch`: the caller already holds the events from
+ * `events.list`, so the eligible set is restricted to the listed ids — but the
+ * selection and the stamping still happen inside the **one** locked
+ * transaction, exactly as above. Choosing the batch from an unlocked snapshot
+ * and stamping it afterwards let two concurrent availability calls both take
+ * the same first five of six eligible ids and leave the sixth uninspected,
+ * breaking the two-observing-call coverage guarantee (REVIEW-07).
+ */
+export async function selectListedBatch(
+  ctx: LifecycleContext,
+  bookingId: string,
+  listed: readonly string[],
+  max: number,
+): Promise<string[]> {
+  if (max <= 0 || listed.length === 0) {
+    return [];
+  }
+  const row = await ctx.store.findByBookingIdForReap(bookingId);
+  if (row === null) {
+    return [];
+  }
+  return ctx.store.withHostLock(row.hostId, async (tx) => {
+    const fresh = await tx.selectForUpdate(bookingId);
+    if (fresh === null) {
+      return [];
+    }
+    const eligible = eligibleReapIds(fresh).filter((eventId) => listed.includes(eventId));
+    if (eligible.length === 0) {
+      return [];
+    }
+    const batch = orderReapCandidates(fresh, eligible).slice(0, max);
+    await tx.stampReapBatch(bookingId, batch, new Date(ctx.clock.now()).toISOString());
+    return batch;
+  });
+}
+
+/**
  * The full reap: select + stamp under the lock, then inspect each batched id
  * outside it. Returns what it inspected and deleted; it never throws for a
  * Google failure, because cleanup must not block the caller's operation.

@@ -3,13 +3,13 @@ import {
   BookingConflictError,
   BookingNotFoundError,
   BookingValidationError,
-  getBooking,
   rescheduleBooking as rescheduleLegacyBooking,
+  type Booking as LegacyBooking,
 } from '@/lib/booking/booking';
 import { getBookingCalendarProvider } from '@/lib/booking/calendar-runtime';
 import { getHostCalendarConnection } from '@/lib/calendar/connection';
 import { rescheduleBooking } from '@/lib/booking/service';
-import { authorizedScope, resolveBookingId } from '@/lib/api/booking-routes';
+import { authorizedScope, durableRowOf, resolveBookingId } from '@/lib/api/booking-routes';
 import { errorResponse, originOf, readJsonBody } from '@/lib/api/route-helpers';
 
 // C2 / C6.6 — `POST /api/bookings/{id}/reschedule`, token-authenticated, body
@@ -37,15 +37,21 @@ export async function POST(
   }
 
   const resolved = await resolveBookingId(id);
-  if (resolved.kind === 'durable') {
-    if (
-      typeof body.expectedRevision !== 'number' ||
-      !Number.isInteger(body.expectedRevision)
-    ) {
-      return Response.json({ error: 'expectedRevision is required' }, { status: 400 });
-    }
+  // Only an **existing** fixture row takes the legacy path; every other id —
+  // durable or unknown — goes through the same bearer check, so the response
+  // never reveals whether the booking exists (C11 — REV-08).
+  if (resolved.kind !== 'legacy') {
     try {
-      const scope = await authorizedScope(request, resolved.row);
+      // Authentication first: a body check that ran before it would answer 400
+      // for an unknown id and 401 for a real one, which is the same oracle in a
+      // different shape (C11 — REV-08).
+      const scope = await authorizedScope(request, durableRowOf(resolved));
+      if (
+        typeof body.expectedRevision !== 'number' ||
+        !Number.isInteger(body.expectedRevision)
+      ) {
+        return Response.json({ error: 'expectedRevision is required' }, { status: 400 });
+      }
       const outcome = await rescheduleBooking(scope, {
         start,
         expectedRevision: body.expectedRevision,
@@ -61,14 +67,14 @@ export async function POST(
     }
   }
 
-  return legacyReschedule(id, start);
+  return legacyReschedule(id, start, resolved.booking);
 }
 
-async function legacyReschedule(id: string, start: string): Promise<Response> {
-  const existing = getBooking(id);
-  if (!existing) {
-    return Response.json({ error: 'booking not found' }, { status: 404 });
-  }
+async function legacyReschedule(
+  id: string,
+  start: string,
+  existing: LegacyBooking,
+): Promise<Response> {
   const eventType = getEventType(existing.eventTypeId);
   const connection = eventType ? getHostCalendarConnection(eventType.hostId) : null;
   const calendarId = connection?.destinationCalendarId ?? 'primary';

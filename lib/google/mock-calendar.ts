@@ -23,6 +23,7 @@ import {
   CalendarError,
   PreconditionFailedError,
   classifyCalendarError,
+  isAbsenceStatus,
   DEFINITE,
 } from './errors';
 import {
@@ -130,6 +131,25 @@ export function createMockCalendar(
       return null;
     }
     return queue.shift() ?? null;
+  }
+
+  /**
+   * A scripted 404/410 means "the resource is not there", which `get` and
+   * `remove` map to absent rather than to a failure — the same mapping the live
+   * adapter applies (C6.0: 404/410 is a *definite* rejection on insert and
+   * patch, a tolerated absence on get and delete). Without this, scripting a
+   * 404 on delete would produce `calendar_delete_failed` for exactly the case
+   * C6.7 tolerates.
+   */
+  function describeFailure(outcome: ScriptedOutcome): string {
+    if ('status' in outcome) {
+      return `events.list ${outcome.status}`;
+    }
+    return outcome.throw instanceof Error ? outcome.throw.message : String(outcome.throw);
+  }
+
+  function scriptedAbsence(outcome: ScriptedOutcome | null): boolean {
+    return outcome !== null && 'status' in outcome && isAbsenceStatus(outcome);
   }
 
   function raise(outcome: ScriptedOutcome): never {
@@ -265,6 +285,9 @@ export function createMockCalendar(
     async get(input: GetEventInput): Promise<CalendarEvent | null> {
       calls.push({ kind: 'get', calendarId: input.calendarId, eventId: input.eventId });
       const failure = takeScripted('get');
+      if (scriptedAbsence(failure)) {
+        return null;
+      }
       if (failure) {
         raise(failure);
       }
@@ -320,6 +343,9 @@ export function createMockCalendar(
         sendUpdates: input.sendUpdates,
       });
       const failure = takeScripted('delete');
+      if (scriptedAbsence(failure)) {
+        return 'absent';
+      }
       if (failure) {
         raise(failure);
       }
@@ -342,16 +368,16 @@ export function createMockCalendar(
         start: input.timeMin,
         end: input.timeMax,
       });
+      // Fail-closed (AC-7 / C7), exactly as the live adapter does: a non-2xx, an
+      // unparseable page, or an error mid-pagination is `AvailabilityUnknown` —
+      // never a short list, and never a raw error that would surface as a 500
+      // instead of 503 `availability_unknown`.
       if (listFailure) {
-        // Fail-closed (AC-7): the caller maps this to `availability_unknown`.
-        if ('throw' in listFailure) {
-          throw listFailure.throw;
-        }
-        throw new AvailabilityUnknownError();
+        throw new AvailabilityUnknownError(describeFailure(listFailure));
       }
       const failure = takeScripted('list');
       if (failure) {
-        raise(failure);
+        throw new AvailabilityUnknownError(describeFailure(failure));
       }
       const minMs = Date.parse(input.timeMin);
       const maxMs = Date.parse(input.timeMax);

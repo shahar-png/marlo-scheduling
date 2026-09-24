@@ -34,6 +34,8 @@ export type DeliveryRow = {
   attempts: number;
 };
 
+export type LedgerClaim = { gen: number } | null;
+
 export type NewBookingRow = {
   id: string;
   token: string;
@@ -132,9 +134,35 @@ export interface BookingTx {
   stampReapBatch(id: string, eventIds: string[], inspectedAt: string): Promise<number[]>;
   /** C6.3a: idempotent by `attemptId`; never touches another entry. */
   retireAttempt(id: string, attemptId: string): Promise<void>;
+  /**
+   * C5 — the atomic claim, issued **inside** this locked transaction.
+   *
+   * Notify validates `(revision, latest_action)` against its own
+   * `selectForUpdate` read and claims here, so the pair cannot change between
+   * the two: without this, a cancel committing in between would let a caller
+   * acquire a fresh claim for an already-superseded `(revision, action)`.
+   */
+  claimDelivery(input: {
+    bookingId: string;
+    revision: number;
+    action: DeliveryAction;
+    recipient: DeliveryRecipient;
+    nowMs: number;
+  }): Promise<LedgerClaim>;
+  /**
+   * A **savepoint-scoped** sub-operation: the failure is returned, not thrown,
+   * and the transaction is left usable.
+   *
+   * In Postgres one failed statement aborts the whole transaction, so a caller
+   * that merely catches a per-item error keeps working with in-memory results
+   * whose writes `COMMIT` will discard (it answers `ROLLBACK`). Anything that
+   * wants to continue after a recoverable failure must go through this
+   * (REVIEW-01).
+   */
+  attempt<T>(
+    fn: () => Promise<T>,
+  ): Promise<{ ok: true; value: T } | { ok: false; error: unknown }>;
 }
-
-export type LedgerClaim = { gen: number } | null;
 
 export interface BookingStore {
   /** One transaction with the per-host lock held (C6). */

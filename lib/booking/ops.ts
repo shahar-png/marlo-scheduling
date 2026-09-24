@@ -20,6 +20,7 @@ import {
   DEFINITE,
   PreconditionFailedError,
   classifyCalendarError,
+  isAbsenceStatus,
   type CalendarOutcomeClass,
 } from '../google/errors';
 import type { CalendarClient, CalendarEvent, SendUpdates } from '../google/calendar';
@@ -28,6 +29,8 @@ import { logLifecycle } from './log';
 import type { BookingStore, BookingTx } from './store';
 import {
   cloneOp,
+  isStaleOp,
+  retryAfterSeconds,
   type Attempt,
   type AttemptKind,
   type BookingRow,
@@ -129,15 +132,51 @@ export async function finishAttempt(
   );
 }
 
+/**
+ * C6.0/C6.3b — settles an attempt from the **error** its own request returned.
+ *
+ * Only an outcome that proves the request did nothing may resolve the attempt:
+ * a `definite` 4xx, a 409 `duplicate`, or a 412. A 429, a 5xx, a timeout, or a
+ * lost connection prove nothing — the mutation may still execute — so the
+ * attempt stays `unresolved` for as long as this app exists, which is what keeps
+ * any event that later lands under its id attributable and reapable.
+ */
+export async function failAttempt(
+  ctx: LifecycleContext,
+  row: BookingRow,
+  op: PendingOp,
+  attemptId: string,
+  error: unknown,
+): Promise<void> {
+  const klass = classifyCalendarError(error);
+  if (klass === AMBIGUOUS || klass === APPLIED) {
+    return;
+  }
+  await finishAttempt(ctx, row, op, attemptId, 'rejected');
+}
+
 export type Observation =
   | { state: 'present'; event: CalendarEvent }
   | { state: 'absent' }
+  /**
+   * The **read itself** was definitely refused (401, 403, 400, 422,
+   * `host_not_connected`, …). This is *not* absence: the event may well exist,
+   * we were simply not allowed to look. Nothing may complete against it —
+   * a caller that treated this as absence would skip a delete and commit
+   * `calendar_state='deleted'` over a live event, or insert a duplicate.
+   */
+  | { state: 'refused'; error: unknown }
   | { state: 'ambiguous'; error: unknown };
 
 /**
  * `events.get` decides whether an **event exists** — never whether an attempt
  * finished (C6.3a / REV5-01). An event counts as this booking's only when it
  * carries the booking's `marloBookingId`.
+ *
+ * Only the documented absence responses (404/410, which the adapter maps to
+ * `null`) establish absence. Every other definite refusal is `refused`: the
+ * distinction C6.0 draws between "the request provably did nothing" and "the
+ * resource is provably not there".
  */
 export async function observeId(
   ctx: LifecycleContext,
@@ -157,11 +196,54 @@ export async function observeId(
   } catch (error) {
     const klass = classifyCalendarError(error);
     if (klass === DEFINITE) {
-      // A definite 4xx on a read still tells us nothing exists for us.
-      return { state: 'absent' };
+      if (isAbsenceStatus(error)) {
+        // 404/410 reached here rather than through the adapter's `null`.
+        return { state: 'absent' };
+      }
+      return { state: 'refused', error };
     }
     return { state: 'ambiguous', error };
   }
+}
+
+/**
+ * C6.2 — what an insert's own 2xx is allowed to establish.
+ *
+ * An insert response may complete an operation only when it actually
+ * identifies the event the operation intended: the id we supplied, and (when
+ * the response echoes it) this booking's `marloBookingId`. Anything else — a
+ * body naming a different id, or one attributed to another booking — is not a
+ * verified event, and the outcome is decided by the shared `events.get`
+ * observation instead of by the insert status (REVIEW-05). A malformed 2xx
+ * never reaches here at all: the adapter classifies it `ambiguous` (C6.0).
+ */
+export async function verifyInsert(
+  ctx: LifecycleContext,
+  bookingId: string,
+  eventId: string,
+  inserted: { id: string; etag: string; marloBookingId?: string },
+): Promise<Observation> {
+  if (
+    inserted.id === eventId &&
+    inserted.etag !== '' &&
+    (inserted.marloBookingId === undefined || inserted.marloBookingId === bookingId)
+  ) {
+    return { state: 'present', event: inserted as CalendarEvent };
+  }
+  return observeId(ctx, bookingId, eventId);
+}
+
+/**
+ * True when the read established **nothing** — it was refused or ambiguous.
+ *
+ * Both cases mean the same thing to a lifecycle step: it may not complete, may
+ * not abandon, and may not treat the id as absent. The op stays owned and the
+ * caller answers 503 `booking_outcome_unknown`, which is the honest report.
+ */
+export function unobserved(
+  observation: Observation,
+): observation is Extract<Observation, { state: 'refused' | 'ambiguous' }> {
+  return observation.state === 'refused' || observation.state === 'ambiguous';
 }
 
 /**
@@ -186,7 +268,9 @@ export async function bumpVersion(
     // governed by C6.3a.
     return { state: 'absent' };
   }
-  if (observed.state === 'ambiguous') {
+  if (unobserved(observed)) {
+    // Refused reads are not absence: the takeover stops rather than proceed
+    // against an event it could not see.
     return { state: 'ambiguous', error: observed.error };
   }
 
@@ -220,13 +304,59 @@ export async function bumpVersion(
       }
       return { state: 'ambiguous', error: again.error };
     }
-    if (klass === DEFINITE) {
+    if (klass === DEFINITE && isAbsenceStatus(error)) {
+      // Only 404/410 means the event is not there for the predecessor to patch.
       await finishAttempt(ctx, row, op, attempt.attemptId, 'rejected');
       return { state: 'absent' };
     }
     // Ambiguous (incl. 429): the takeover stops and keeps `pending_op`.
     return { state: 'ambiguous', error };
   }
+}
+
+export type AcquiredOp =
+  /** Ownership acquired: `op` is this worker's, `row` is the locked snapshot. */
+  | { state: 'taken'; op: PendingOp; row: BookingRow }
+  /** Someone else owns it right now — non-terminal, nothing written. */
+  | { state: 'busy'; retryAfterSeconds: number }
+  /** No op of the requested kind is on the row any more. */
+  | { state: 'gone' };
+
+/**
+ * C6.3 — **acquires** ownership of a stale op, deciding both staleness and the
+ * op's identity from the row read **inside** the takeover transaction.
+ *
+ * A snapshot taken before the lock establishes only that the op *was* stale.
+ * Two retries can both read generation 1 as stale; if the second then took over
+ * whatever generation it found under the lock, it would immediately steal the
+ * generation 2 the first had just established and renewed — two live owners of
+ * one operation, which is exactly what the stale window exists to prevent.
+ *
+ * This is **acquisition**, never resumption: a caller that already owns the op
+ * (it took it over itself, or inherited it) must not call this — bumping the
+ * generation again would invalidate its own ownership.
+ */
+export async function acquireStaleOp(
+  ctx: LifecycleContext,
+  row: BookingRow,
+  kinds: readonly OpKind[],
+): Promise<AcquiredOp> {
+  return ctx.store.withHostLock(row.hostId, async (tx) => {
+    const fresh = await tx.selectForUpdate(row.id);
+    if (fresh === null || fresh.pendingOp === null || !kinds.includes(fresh.pendingOp.kind)) {
+      return { state: 'gone' as const };
+    }
+    const now = ctx.clock.now();
+    if (!isStaleOp(fresh.pendingOp, now)) {
+      // Renewed between the snapshot and this lock: still owned elsewhere.
+      return { state: 'busy' as const, retryAfterSeconds: retryAfterSeconds(fresh.pendingOp, now) };
+    }
+    const taken = await takeOverOp(tx, fresh, fresh.pendingOp, ctx.clock);
+    if (taken === null) {
+      return { state: 'busy' as const, retryAfterSeconds: 1 };
+    }
+    return { state: 'taken' as const, op: taken, row: fresh };
+  });
 }
 
 /** C6.3 takeover: `gen+1`, conditioned on opId/gen. */

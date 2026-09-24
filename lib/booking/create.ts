@@ -17,12 +17,14 @@
 
 import { UnknownCommitError } from '../db/index';
 import { AvailabilityUnknownError } from '../google/errors';
+import type { InsertEventInput } from '../google/calendar';
 import { logLifecycle } from './log';
 import {
   AvailabilityUnknownResponse,
   BookingFailedError,
   BookingOutcomeUnknownError,
   IdempotencyKeyReusedError,
+  LifecycleError,
   OperationInProgressError,
   OperationSupersededError,
   SessionFullError,
@@ -42,7 +44,9 @@ import {
   finishAttempt,
   newAttempt,
   observeId,
-  takeOverOp,
+  acquireStaleOp,
+  unobserved,
+  verifyInsert,
   writeAttempt,
   OUTCOME_DEFINITE,
   classifyCalendarError,
@@ -58,6 +62,7 @@ import {
   type RejectionReason,
 } from './rows';
 import { cleanupOwnEvent, reconcileSuperseded, retireWithoutDelete } from './superseded';
+import { settleCompletion } from './settle';
 import type { CreateOpIdentity } from './create-identity';
 import { OutcomeUnresolvedError } from './store';
 
@@ -100,6 +105,27 @@ export type CreateDeps = {
   meta: EnvelopeMeta;
   /** Runs the `(1, 'confirm')` emails after T2/T2′ commits. */
   notify: (row: BookingRow) => Promise<void>;
+  /**
+   * C9 — gates that apply to a **new submission only**, checked once L0 has
+   * proved the key is missing. A replay is deliberately exempt: its row may
+   * already exist, and refusing to finish it because its slot has since passed
+   * is exactly how a committed booking gets stranded (REV3-06).
+   *
+   * It **returns** a rejection reason rather than throwing one, because a
+   * terminal 409 on create is only terminal once it has been **fenced** in the
+   * locked T1 transaction (C6.4/REV8-01). Answering here would re-open the
+   * lost-booking interleaving the fence exists to close: a request paused
+   * before its own T1 could still insert after this 409 made the client clear
+   * its key. `null` means the submission may proceed.
+   */
+  gateNewSubmission?: () => RejectionReason | null;
+  /**
+   * C10 — extra work that must commit **with** T2, under the same host lock and
+   * behind the same versioned update. The legacy one-off link uses it to consume
+   * its token, which is why a failure here is a T2 failure (`pending_op` is
+   * retained, the create resumes) and never a rollback after a Google insert.
+   */
+  onFinalize?: (row: BookingRow) => void | Promise<void>;
   hooks?: CreateHooks;
 };
 
@@ -135,21 +161,30 @@ export async function createDurableBooking(
     return replayOrResume(deps, request, l0.row, fingerprint);
   }
 
+  // The key is missing, so this is a genuinely new submission: the server clock
+  // and the published grid apply before anything else is read or written. The
+  // gate **decides** here and T1 **answers**, so the refusal is durably fenced.
+  const gated = deps.gateNewSubmission?.() ?? null;
+
   // ---- R0 ---------------------------------------------------------------
-  let external: Interval[];
-  try {
-    external = await externalBusy(ctx, {
-      window,
-      ...(request.timeZone === undefined ? {} : { timeZone: request.timeZone }),
-    });
-  } catch (error) {
-    if (error instanceof AvailabilityUnknownError) {
-      // Nothing written, no fence: non-terminal, the client retains its key.
-      throw new AvailabilityUnknownResponse();
+  // An already-decided submission skips the external read entirely: it cannot
+  // change the answer, and it would be a Google call for a slot nobody offered.
+  let external: Interval[] = [];
+  if (gated === null) {
+    try {
+      external = await externalBusy(ctx, {
+        window,
+        ...(request.timeZone === undefined ? {} : { timeZone: request.timeZone }),
+      });
+    } catch (error) {
+      if (error instanceof AvailabilityUnknownError) {
+        // Nothing written, no fence: non-terminal, the client retains its key.
+        throw new AvailabilityUnknownResponse();
+      }
+      throw error;
     }
-    throw error;
+    await deps.hooks?.afterR0?.();
   }
-  await deps.hooks?.afterR0?.();
 
   // ---- T1 ---------------------------------------------------------------
   const intendedId = newCalendarEventId();
@@ -174,6 +209,12 @@ export async function createDurableBooking(
       if (existing !== null) {
         // X is discarded: a replay never consults the external snapshot.
         return { kind: 'existing', row: existing };
+      }
+      if (gated !== null) {
+        // An elapsed or off-grid start is a terminal rejection like any other,
+        // so it is fenced in the transaction that refuses it (REV8-01).
+        await fenceRejection(tx, request, fingerprint, gated);
+        return { kind: 'rejected', reason: gated };
       }
       if (busyOverlaps(window, external)) {
         await fenceRejection(tx, request, fingerprint, 'slot_unavailable');
@@ -214,9 +255,14 @@ export async function createDurableBooking(
     if (error instanceof UnknownCommitError) {
       // C6.5: reacquire the lock on a fresh connection — which establishes the
       // original transaction has finished — and only then read.
-      t1 = await reconcileT1(deps, request, fingerprint);
-    } else {
+      t1 = await reconcileT1(deps, request, fingerprint, opId);
+    } else if (error instanceof LifecycleError) {
       throw error;
+    } else {
+      // A **definite** T1 failure. Nothing to compensate: R0 was a read and no
+      // Google mutation has happened yet, so this is simply 500 `booking_failed`
+      // with no row and no token (C6.4). The client retains its key and replays.
+      throw new BookingFailedError();
     }
   }
 
@@ -258,11 +304,25 @@ async function reconcileT1(
   deps: CreateDeps,
   request: CreateBookingRequest,
   fingerprint: string,
+  opId: string,
 ): Promise<T1Result> {
   try {
     return await deps.ctx.store.withFinishedTransaction(request.hostId, async (tx) => {
       const row = await tx.lookupKey(request.ownerId, request.idempotencyKey);
       if (row !== null) {
+        // "Row present → continue at the calendar step" (C6.4). The row this
+        // reconciler found may be **its own** committed T1 — the commit
+        // succeeded, only its response was lost — in which case this worker is
+        // still the owner and resumes its own operation. Routing it through the
+        // replay path instead would answer `operation_in_progress` against
+        // itself, because its own op is a non-stale create owned by nobody else.
+        const op = row.pendingOp;
+        if (op !== null && op.kind === 'create' && op.opId === opId) {
+          const attempt = op.attempts.find((entry) => entry.kind === 'insert');
+          if (attempt !== undefined) {
+            return { kind: 'inserted', row, op, attemptId: attempt.attemptId } as T1Result;
+          }
+        }
         return { kind: 'existing', row } as T1Result;
       }
       const fence = await tx.lookupRejection(
@@ -321,28 +381,31 @@ export async function runCreateCalendarStep(
   let insertEtag: string | null = null;
 
   try {
-    const event = await ctx.calendar.insert({
-      calendarId: ctx.calendarId,
-      id: eventId,
-      start: row.start,
-      end: row.end,
-      summary: request.eventName,
-      bookingId: row.id,
-      attemptId,
-      sendUpdates: ctx.sendUpdates,
-      ...(ctx.sendUpdates === 'all'
-        ? {
-            attendees: [
-              { email: request.invitee.email, displayName: request.invitee.name },
-            ],
-          }
-        : {}),
-    });
+    const event = await ctx.calendar.insert(
+      createInsertBody(ctx, request, row, eventId, attemptId),
+    );
+    // C6.2 — the response must identify the event it claims to have created.
+    // A 2xx that names another id, or one attributed to another booking, is
+    // decided by `events.get`, not by its status (REVIEW-05).
+    const verified = await verifyInsert(ctx, row.id, eventId, event);
+    if (verified.state !== 'present') {
+      logLifecycle('attempt_unresolved', {
+        bookingId: row.id,
+        opId: op.opId,
+        gen: op.gen,
+        attemptId,
+        eventId,
+      });
+      throw new BookingOutcomeUnknownError();
+    }
     insertOutcome = 'applied';
-    insertEtag = event.etag;
-    etag = event.etag;
+    insertEtag = verified.event.etag;
+    etag = verified.event.etag;
     await finishAttempt(ctx, row, op, attemptId, 'applied');
   } catch (error) {
+    if (error instanceof BookingOutcomeUnknownError) {
+      throw error;
+    }
     const klass = classifyCalendarError(error);
     if (klass === 'already_exists') {
       // This request created nothing; `events.get` decides the OP (C6.2).
@@ -415,6 +478,42 @@ export async function runCreateCalendarStep(
   };
 }
 
+/**
+ * The one insert body every create attempt uses — the first and every retry
+ * (REVIEW-08).
+ *
+ * Attendees and `sendUpdates` are a **pair**: under `calendar_invitation` C4
+ * requires the invitee on the event *and* `sendUpdates=all`, so Google issues
+ * its native invite. A retry that sent `sendUpdates` without the attendee list
+ * finalized the booking with no invite for the guest, and only on the
+ * 409 → absent → retry path — invisible on the happy path.
+ */
+function createInsertBody(
+  ctx: LifecycleContext,
+  request: CreateBookingRequest,
+  row: BookingRow,
+  eventId: string,
+  attemptId: string,
+): InsertEventInput {
+  return {
+    calendarId: ctx.calendarId,
+    id: eventId,
+    start: row.start,
+    end: row.end,
+    summary: request.eventName,
+    bookingId: row.id,
+    attemptId,
+    sendUpdates: ctx.sendUpdates,
+    ...(ctx.sendUpdates === 'all'
+      ? {
+          attendees: [
+            { email: request.invitee.email, displayName: request.invitee.name },
+          ],
+        }
+      : {}),
+  };
+}
+
 async function retryInsert(
   deps: CreateDeps,
   request: CreateBookingRequest,
@@ -429,18 +528,16 @@ async function retryInsert(
     return { outcome: 'ambiguous', etag: null };
   }
   try {
-    const event = await ctx.calendar.insert({
-      calendarId: ctx.calendarId,
-      id: eventId,
-      start: row.start,
-      end: row.end,
-      summary: request.eventName,
-      bookingId: row.id,
-      attemptId: attempt.attemptId,
-      sendUpdates: ctx.sendUpdates,
-    });
+    const event = await ctx.calendar.insert(
+      createInsertBody(ctx, request, row, eventId, attempt.attemptId),
+    );
+    const verified = await verifyInsert(ctx, row.id, eventId, event);
+    if (verified.state !== 'present') {
+      // An unverifiable 2xx completes nothing (C6.2, REVIEW-05).
+      return { outcome: 'ambiguous', etag: null };
+    }
     await finishAttempt(ctx, row, op, attempt.attemptId, 'applied');
-    return { outcome: 'applied', etag: event.etag };
+    return { outcome: 'applied', etag: verified.event.etag };
   } catch (error) {
     const klass = classifyCalendarError(error);
     if (klass === OUTCOME_DEFINITE) {
@@ -482,6 +579,37 @@ async function completeCreate(
   etag: string | null,
 ): Promise<{ superseded: boolean; row: BookingRow }> {
   const { ctx } = deps;
+  const settled = await settleCompletion(
+    ctx,
+    row,
+    () => completeCreateTx(deps, row, op, calendarState, etag),
+    // The creation is finalized once `latest_action` is non-null and this op is
+    // no longer named — whether this worker's T2 or a takeover's wrote it.
+    (fresh) =>
+      fresh !== null &&
+      fresh.latestAction !== null &&
+      (fresh.pendingOp === null || fresh.pendingOp.opId !== op.opId),
+  );
+  if (settled.kind === 'reconciled') {
+    return { superseded: false, row: settled.row };
+  }
+  if (settled.kind === 'failed') {
+    // Nothing to compensate: the event under the intended id IS the booking's
+    // event, so it is kept and `pending_op` is retained for the resume. The
+    // retry resumes at T2 with zero further inserts (C6.4).
+    throw new BookingFailedError();
+  }
+  return settled.value;
+}
+
+async function completeCreateTx(
+  deps: CreateDeps,
+  row: BookingRow,
+  op: PendingOp,
+  calendarState: 'created' | 'failed',
+  etag: string | null,
+): Promise<{ superseded: boolean; row: BookingRow }> {
+  const { ctx } = deps;
   const result = await ctx.store.withHostLock(row.hostId, async (tx) => {
     const fresh = await tx.selectForUpdate(row.id);
     if (fresh === null || fresh.pendingOp === null) {
@@ -505,6 +633,8 @@ async function completeCreate(
     if (!updated) {
       return { superseded: true, row: fresh };
     }
+    // C10 — inside T2, after the versioned update carried.
+    await deps.onFinalize?.(fresh);
     for (const entry of retained) {
       logLifecycle('attempt_unresolved', {
         bookingId: row.id,
@@ -514,13 +644,24 @@ async function completeCreate(
         eventId: entry.eventId,
       });
     }
-    return { superseded: false, row: fresh };
+    // **This T2's own committed snapshot**, built from the row it conditioned on
+    // plus exactly the patch it applied. Any later read — locked or not — can
+    // only show whatever committed last, and the caller would then notify with
+    // that later `revision` under this op's `action`, claiming a
+    // `(revision, action)` pair the booking never held (LIVE-REVIEW-06). The 201
+    // envelope is built from a separate fresh read.
+    const committed: BookingRow = {
+      ...fresh,
+      latestAction: 'confirm',
+      calendarState,
+      ...(etag === null ? {} : { googleEventEtag: etag }),
+      pendingOp: null,
+      unfinishedCreate: null,
+      unresolvedInserts: retained,
+    };
+    return { superseded: false, row: committed };
   });
-  if (result.superseded) {
-    return result;
-  }
-  const after = (await ctx.store.getById(row.id)) ?? result.row;
-  return { superseded: false, row: after };
+  return result;
 }
 
 async function supersededCreate(
@@ -536,12 +677,17 @@ async function supersededCreate(
     attemptId: string;
   },
 ): Promise<CreateOutcome> {
-  const decision = await reconcileSuperseded(deps.ctx, {
-    kind: 'create',
-    op,
-    identity,
-    bookingId: row.id,
-  });
+  const decision = await reconcileSuperseded(
+    deps.ctx,
+    {
+      kind: 'create',
+      op,
+      identity,
+      bookingId: row.id,
+      ownInsert: { attemptId: insert.attemptId, eventId: insert.eventId },
+    },
+    row.hostId,
+  );
 
   // (2) Cleanup eligibility is decided separately from (1), and only a
   // definite 2xx insert response may act on it.
@@ -604,20 +750,21 @@ export async function replayOrResume(
   // (1) An open create op → resume it.
   if (row.pendingOp !== null && row.pendingOp.kind === 'create') {
     if (!isStaleOp(row.pendingOp, ctx.clock.now())) {
-      // Owned elsewhere: non-terminal, zero Google calls, nothing written.
+      // Owned elsewhere: non-terminal, zero Google calls, nothing written. This
+      // is the cheap pre-check; the authoritative one is inside the lock below.
       throw new OperationInProgressError(retryAfterSeconds(row.pendingOp, ctx.clock.now()));
     }
-    const taken = await ctx.store.withHostLock(row.hostId, async (tx) => {
-      const fresh = await tx.selectForUpdate(row.id);
-      if (fresh === null || fresh.pendingOp === null || fresh.pendingOp.kind !== 'create') {
-        return null;
-      }
-      return takeOverOp(tx, fresh, fresh.pendingOp, ctx.clock);
-    });
-    if (taken === null) {
+    // Staleness is re-decided under the lock, against the generation actually on
+    // the row: a second replay that also saw generation 1 as stale must not
+    // steal the generation 2 the first one just established (C6.3).
+    const acquired = await acquireStaleOp(ctx, row, ['create']);
+    if (acquired.state === 'busy') {
+      throw new OperationInProgressError(acquired.retryAfterSeconds);
+    }
+    if (acquired.state === 'gone') {
       throw new OperationInProgressError(1);
     }
-    return resumeCreate(deps, request, row, taken, identity);
+    return resumeCreate(deps, request, acquired.row, acquired.op, identity);
   }
 
   // (2) Finalized → 201 from the row, whatever `pending_op` now holds.
@@ -658,7 +805,9 @@ export async function resumeCreate(
   const eventId = op.eventId as string;
   const observed = await observeId(ctx, row.id, eventId);
 
-  if (observed.state === 'ambiguous') {
+  if (unobserved(observed)) {
+    // A refused read is not absence: resuming with an insert could duplicate an
+    // event that already exists under this id.
     throw new BookingOutcomeUnknownError();
   }
   if (observed.state === 'present') {

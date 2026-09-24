@@ -26,6 +26,8 @@ const OK = new Set([200, 201, 202, 204]);
 const CONFLICT = 409;
 const PRECONDITION = 412;
 const RATE_LIMITED = 429;
+const NOT_FOUND = 404;
+const GONE = 410;
 const CLIENT_MIN = 400;
 const CLIENT_MAX = 499;
 
@@ -113,6 +115,21 @@ export function classifyCalendarError(outcome: ClassifiableOutcome): CalendarOut
   }
   // Timeout, network error, malformed response, process death.
   return AMBIGUOUS;
+}
+
+/**
+ * 404/410 — the resource is not there.
+ *
+ * This is a *different question* from the C6.0 classification and the two must
+ * not be confused: on `insert` and `patch` a 404/410 is a **definite** rejection
+ * (the mutation provably did nothing), while on `get` and `remove` it is a
+ * tolerated **absence** — `get` returns `null` and `remove` answers `absent`
+ * (C6.7's "404/410 tolerated"). It lives here so the adapters share one notion
+ * of "not there" and no module outside this file reads a status number.
+ */
+export function isAbsenceStatus(outcome: ClassifiableOutcome): boolean {
+  const status = statusOf(outcome);
+  return status === NOT_FOUND || status === GONE;
 }
 
 /** Gmail uses the same rule for the C5 finalisation (429 stays ambiguous). */

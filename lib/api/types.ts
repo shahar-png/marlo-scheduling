@@ -79,10 +79,28 @@ export type BookingConflictCode =
 export type CreateBookingResult =
   | { ok: true; booking: PublicBooking }
   | { ok: false; code: BookingConflictCode }
-  | { ok: false; code: typeof UNKNOWN_ERROR; status?: number; error?: string };
+  | {
+      ok: false;
+      code: typeof UNKNOWN_ERROR;
+      status?: number;
+      error?: string;
+      /**
+       * C9 — the server's own wait for a non-terminal 409
+       * `operation_in_progress`. Dropping it left the form with no window to
+       * honour and no way to perform the single automatic replay C9 requires
+       * (LIVE-REVIEW-11).
+       */
+      retryAfterSeconds?: number;
+    };
 
 export type GetSlotsInput = {
   slug: string;
+  /**
+   * C1 — the owner whose availability this is. Present on the product page, so
+   * two owners offering `intro-30` each see their own calendar; absent only on
+   * the retained legacy fixture surface, which resolves within `demo`.
+   */
+  ownerSlug?: string;
   // `[timeMin, timeMax)` is a window of **start** instants (BOOK-FE-12).
   timeMin: string;
   timeMax: string;
@@ -113,6 +131,24 @@ export const GROUP_NOT_SUPPORTED = 'group_not_supported' as const;
 export const COLLECTIVE_NOT_SUPPORTED = 'collective_not_supported' as const;
 export const BOOKING_CHANGED = 'booking_changed' as const;
 export const STALE_REVISION = 'stale_revision' as const;
+
+/** C11 — every `/api/bookings/{id}/*` call needs both, and they are not equal. */
+export type BookingCredentials = { id: string; token: string };
+
+/**
+ * The result shape the `/b/{token}` control machine branches on (C12). A
+ * lifecycle call never throws for a contract error: the code is the state.
+ */
+export type LifecycleResult =
+  | { ok: true; booking: PublicBooking }
+  | {
+      ok: false;
+      status: number;
+      code: string;
+      retryAfterSeconds?: number;
+      /** Present when the server reported the current row alongside the error. */
+      booking?: PublicBooking;
+    };
 
 export type BookingApi = {
   getSlots(input: GetSlotsInput): Promise<SlotsResult>;

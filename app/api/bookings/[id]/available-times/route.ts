@@ -1,5 +1,5 @@
 import { bookingAvailability } from '@/lib/booking/service';
-import { authorizedScope, resolveBookingId } from '@/lib/api/booking-routes';
+import { authorizedScope, durableRowOf, resolveBookingId } from '@/lib/api/booking-routes';
 import { errorResponse, windowFrom } from '@/lib/api/route-helpers';
 
 // C2 / C12 — the reschedule picker's source. Same occupancy computation as the
@@ -25,10 +25,7 @@ export async function GET(
 
   const resolved = await resolveBookingId(id);
   try {
-    const scope = await authorizedScope(
-      request,
-      resolved.kind === 'durable' ? resolved.row : null,
-    );
+    const scope = await authorizedScope(request, durableRowOf(resolved));
     return Response.json({ times: await bookingAvailability(scope, window) });
   } catch (error) {
     const mapped = errorResponse(error);

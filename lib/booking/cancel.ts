@@ -19,6 +19,7 @@
 
 import {
   BookingChangedError,
+  BookingFailedError,
   BookingOutcomeUnknownError,
   CalendarDeleteFailedError,
   OperationInProgressError,
@@ -33,12 +34,15 @@ import {
   newAttempt,
   observeId,
   takeOverOp,
+  unobserved,
   writeAttempt,
   classifyCalendarError,
   OUTCOME_DEFINITE,
   type LifecycleContext,
 } from './ops';
+import { isAbsenceStatus } from '../google/errors';
 import { hasEligibleReap, reapRetiredIds } from './reap';
+import { settleCompletion } from './settle';
 import {
   isStaleOp,
   retainedFrom,
@@ -88,10 +92,18 @@ export async function cancelDurableBooking(
   }
 
   if (existing.status === 'cancelled') {
-    // Already terminal: the retry is idempotent.
+    // Already terminal: the retry is idempotent — but cancel is a **designated
+    // observing call** (C6.3a), and a retained insert can land after the cancel
+    // released the interval. Returning 200 before the bounded reap would let
+    // repeated cancel retries leave that late event on the host's calendar
+    // forever (REV-04). The envelope is built from the reloaded row.
+    if (hasEligibleReap(existing)) {
+      await reapRetiredIds(ctx, existing.id);
+    }
+    const reaped = (await ctx.store.getById(existing.id)) ?? existing;
     return {
-      envelope: await buildEnvelope(ctx.store, existing, deps.meta, 'lifecycle'),
-      row: existing,
+      envelope: await buildEnvelope(ctx.store, reaped, deps.meta, 'lifecycle'),
+      row: reaped,
     };
   }
 
@@ -107,6 +119,7 @@ export async function cancelDurableBooking(
     }
 
     let inherited: PendingOp | null = null;
+    let inheritedStartedAt: string | null = null;
     let carry: UnfinishedCreate | null = row.unfinishedCreate;
 
     if (row.pendingOp !== null) {
@@ -125,6 +138,11 @@ export async function cancelDurableBooking(
         // Refuse rather than race (C6.7).
         return { kind: 'busy' as const, row, op };
       }
+      // `takeOverOp` stamps `startedAt = now`. The unfinished-create carry must
+      // keep the ORIGINAL create's timestamp, which is what makes the restored
+      // op immediately takeable after a cancel T2′ (C6.7 / REV14-01) instead of
+      // parking the row for another full stale window.
+      inheritedStartedAt = op.startedAt;
       const taken = await takeOverOp(tx, row, op, ctx.clock);
       if (taken === null) {
         return { kind: 'raced' as const, row };
@@ -146,14 +164,43 @@ export async function cancelDurableBooking(
       if (inherited.fallbackEventId !== undefined) {
         op.fallbackEventId = inherited.fallbackEventId;
       }
+      // An inherited op is reconciled from observed Google state *outside* the
+      // lock before the cancel's own op can be written, so it is persisted by
+      // the second, revision-conditioned transaction below.
+      return {
+        kind: 'started' as const,
+        row,
+        op,
+        inherited,
+        inheritedStartedAt,
+        carry,
+        persisted: false as const,
+      };
     }
 
+    // The ordinary cancel: persist the op in the SAME locked transaction that
+    // validated `revision` and `pending_op`. Writing it later would leave a
+    // window in which a reschedule could start or complete between validation
+    // and persistence, and the cancel would then overwrite its ownership
+    // (C6.7 / C6: every state-changing update is conditional on the revision
+    // the caller validated).
+    const persisted = await tx.update({
+      id: row.id,
+      expectedRevision: row.revision,
+      requireConfirmed: true,
+      patch: { pendingOp: op },
+    });
+    if (!persisted) {
+      return { kind: 'raced' as const, row };
+    }
     return {
       kind: 'started' as const,
       row,
       op,
-      inherited,
+      inherited: null,
+      inheritedStartedAt,
       carry,
+      persisted: true as const,
     };
   });
 
@@ -170,14 +217,36 @@ export async function cancelDurableBooking(
     throw new OperationInProgressError(retryAfterSeconds(t1.op, ctx.clock.now()));
   }
   if (t1.kind === 'resumed') {
+    // C6.3c — a takeover's FIRST Google mutation invalidates the predecessor's
+    // version, and that holds for a **same-kind** takeover too (REVIEW-01).
+    // Without it the predecessor still holds a usable `If-Match`: it can be
+    // paused before its own delete, watch this worker take the op over and hit
+    // a definite delete refusal (T2′ clears `pending_op` and leaves the booking
+    // `confirmed`/`created`), and then land its delete anyway — a confirmed row
+    // whose calendar event is gone. The bump makes that delete 412 instead.
+    for (const eventId of intendedIds(t1.op, t1.row)) {
+      const bumped = await bumpVersion(ctx, t1.row, t1.op, eventId);
+      if (bumped.state === 'ambiguous') {
+        // Neither bumped nor known absent: the takeover stops under its new
+        // `gen` and the retry re-observes (C6.3c).
+        throw new BookingOutcomeUnknownError();
+      }
+    }
     return runCancelCalendarStep(deps, request, t1.row, t1.op);
   }
 
   // A taken-over create/repair/reschedule is reconciled BEFORE the cancel.
   let op = t1.op;
   let carry = t1.carry;
+  let releaseReservation = false;
   if (t1.inherited !== null) {
-    const outcome = await reconcileInherited(deps, t1.row, t1.inherited, op);
+    const outcome = await reconcileInherited(
+      deps,
+      t1.row,
+      t1.inherited,
+      op,
+      t1.inheritedStartedAt ?? t1.inherited.startedAt,
+    );
     if (outcome.kind === 'completed') {
       // The inherited op finished on its own terms; cancel the RESULTING event
       // under whatever revision that completion left behind (C6.7).
@@ -194,10 +263,20 @@ export async function cancelDurableBooking(
     }
     carry = outcome.carry ?? carry;
     op = outcome.op;
+    releaseReservation = outcome.releaseReservation;
   }
 
-  // Persist the cancel op (with the inherited ids) and the unfinished-create
-  // carry together, in one T1 update.
+  // The ordinary cancel already persisted its op inside the validating lock.
+  if (t1.persisted) {
+    await deps.hooks?.afterT1?.();
+    const withOwnOp = (await ctx.store.getById(t1.row.id)) ?? t1.row;
+    return runCancelCalendarStep(deps, request, withOwnOp, op);
+  }
+
+  // Replacing a taken-over op: conditional on the revision this call validated
+  // AND on the inherited op's `opId`/`gen`, so a reschedule that started or
+  // completed in the meantime is never silently overwritten (C6.3, C6.7).
+  const inheritedOp = t1.inherited;
   const started = await ctx.store.withHostLock(t1.row.hostId, async (tx) => {
     const fresh = await tx.selectForUpdate(t1.row.id);
     if (fresh === null) {
@@ -205,10 +284,16 @@ export async function cancelDurableBooking(
     }
     return tx.update({
       id: fresh.id,
-      expectedRevision: fresh.revision,
+      expectedRevision: t1.row.revision,
+      requireConfirmed: true,
+      ...(inheritedOp === null
+        ? {}
+        : { opId: inheritedOp.opId, gen: inheritedOp.gen }),
       patch: {
         pendingOp: op,
         ...(carry === null ? {} : { unfinishedCreate: carry }),
+        // The abandoned reschedule's destination dies with its op (C6.1).
+        ...(releaseReservation ? { reservedStart: null, reservedEnd: null } : {}),
       },
     });
   });
@@ -223,13 +308,28 @@ export async function cancelDurableBooking(
 
 type InheritedOutcome =
   | { kind: 'completed'; revisionAdvanced: boolean }
-  | { kind: 'proceed'; op: PendingOp; carry: UnfinishedCreate | null };
+  | {
+      kind: 'proceed';
+      op: PendingOp;
+      carry: UnfinishedCreate | null;
+      /**
+       * C6.1/C6.6 — set when this takeover **abandoned** a reschedule that
+       * achieved nothing. Its destination reservation must die with it: the
+       * reschedule's own T2′ is never going to run, so the transaction that
+       * replaces its `pending_op` is the one that has to release it, or the
+       * destination stays occupied with no operation able to reconcile it
+       * (LIVE-REVIEW-07).
+       */
+      releaseReservation: boolean;
+    };
 
 async function reconcileInherited(
   deps: CancelDeps,
   row: BookingRow,
   inherited: PendingOp,
   cancelOp: PendingOp,
+  /** The taken-over op's timestamp BEFORE `takeOverOp` renewed it. */
+  inheritedStartedAt: string,
 ): Promise<InheritedOutcome> {
   const { ctx } = deps;
 
@@ -244,7 +344,9 @@ async function reconcileInherited(
   if (inherited.kind === 'create' || inherited.kind === 'calendar_repair') {
     const eventId = inherited.eventId as string;
     const observed = await observeId(ctx, row.id, eventId);
-    if (observed.state === 'ambiguous') {
+    if (unobserved(observed)) {
+      // Refused or ambiguous: the id is NOT absent, so the create/repair may
+      // neither be completed nor replaced. `pending_op` stays owned (C6.0).
       throw new BookingOutcomeUnknownError();
     }
     if (observed.state === 'present') {
@@ -261,11 +363,12 @@ async function reconcileInherited(
             opId: inherited.opId,
             gen: inherited.gen,
             eventId,
-            startedAt: inherited.startedAt,
+            // The original create's timestamp, not the takeover's (REV14-01).
+            startedAt: inheritedStartedAt,
             attempts: inherited.attempts.map((attempt) => ({ ...attempt })),
           }
         : null;
-    return { kind: 'proceed', op: cancelOp, carry };
+    return { kind: 'proceed', op: cancelOp, carry, releaseReservation: false };
   }
 
   // A stale reschedule: complete it if it achieved its move, else abandon it.
@@ -277,7 +380,7 @@ async function reconcileInherited(
     fallbackId === undefined
       ? { state: 'absent' as const }
       : await observeId(ctx, row.id, fallbackId);
-  if (observedOld.state === 'ambiguous' || observedFallback.state === 'ambiguous') {
+  if (unobserved(observedOld) || unobserved(observedFallback)) {
     throw new BookingOutcomeUnknownError();
   }
   const moved = observedOld.state === 'present' && observedOld.event.start === inherited.newStart;
@@ -288,8 +391,9 @@ async function reconcileInherited(
     return { kind: 'completed', revisionAdvanced: true };
   }
   // Nothing achieved: the reschedule is abandoned and its outstanding fallback
-  // id is retained by the cancel's own T2.
-  return { kind: 'proceed', op: cancelOp, carry: null };
+  // id is retained by the cancel's own T2. Its destination reservation is
+  // released by the transaction that replaces its op (C6.6 T2′ semantics).
+  return { kind: 'proceed', op: cancelOp, carry: null, releaseReservation: true };
 }
 
 async function runCancelCalendarStep(
@@ -308,7 +412,7 @@ async function runCancelCalendarStep(
   }
   for (const eventId of inheritedIntendedIds(op, row)) {
     const observed = await observeId(ctx, row.id, eventId);
-    if (observed.state === 'ambiguous') {
+    if (unobserved(observed)) {
       throw new BookingOutcomeUnknownError();
     }
     if (observed.state === 'present') {
@@ -323,9 +427,18 @@ async function runCancelCalendarStep(
           await ctx.store.retireAttempt(row.id, observed.event.marloAttemptId);
         }
       } catch (error) {
-        if (classifyCalendarError(error) !== OUTCOME_DEFINITE) {
-          throw new BookingOutcomeUnknownError();
+        // C6.7 permits cancel T2 only when every present inherited id received
+        // a **definite delete outcome**. A tolerated absence (404/410) counts;
+        // any other definite refusal does not, and swallowing it would cancel
+        // the booking while that event is still on the host's calendar.
+        if (isAbsenceStatus(error)) {
+          continue;
         }
+        if (classifyCalendarError(error) === OUTCOME_DEFINITE) {
+          await cancelT2Prime(deps, row, op);
+          throw new CalendarDeleteFailedError();
+        }
+        throw new BookingOutcomeUnknownError();
       }
     }
   }
@@ -334,7 +447,10 @@ async function runCancelCalendarStep(
   if (liveId !== undefined) {
     // Attribute the live id's deletion too, when an entry names it (REV6-01).
     const observed = await observeId(ctx, row.id, liveId);
-    if (observed.state === 'ambiguous') {
+    if (unobserved(observed)) {
+      // A refused read must never become "already gone": committing
+      // `calendar_state='deleted'` and releasing occupancy here would strand a
+      // live event on the host's calendar.
       throw new BookingOutcomeUnknownError();
     }
     if (observed.state === 'present') {
@@ -382,6 +498,30 @@ async function runCancelCalendarStep(
 }
 
 async function cancelT2(
+  deps: CancelDeps,
+  row: BookingRow,
+  op: PendingOp,
+): Promise<{ superseded: boolean; row: BookingRow }> {
+  const { ctx } = deps;
+  const settled = await settleCompletion(
+    ctx,
+    row,
+    () => cancelT2Tx(deps, row, op),
+    (fresh) => fresh !== null && fresh.status === 'cancelled',
+  );
+  if (settled.kind === 'reconciled') {
+    return { superseded: false, row: settled.row };
+  }
+  if (settled.kind === 'failed') {
+    // Nothing to compensate — the delete already happened and deleting an
+    // already-deleted event is a tolerated 404. `pending_op` stays, so the next
+    // cancel call resumes at T2 and answers 200 `cancelled` (C6.7).
+    throw new BookingFailedError();
+  }
+  return settled.value;
+}
+
+async function cancelT2Tx(
   deps: CancelDeps,
   row: BookingRow,
   op: PendingOp,
@@ -446,7 +586,16 @@ async function cancelT2Prime(
         expectedRevision: fresh.revision,
         opId: op.opId,
         gen: op.gen,
-        patch: { pendingOp: null, unresolvedInserts: retained },
+        patch: {
+          pendingOp: null,
+          // The clearing transaction leaves no reservation behind: any
+          // destination this cancel inherited from an abandoned reschedule has
+          // no operation left to reconcile it (C6.1 — LIVE-REVIEW-07). A row
+          // that never held one is unaffected.
+          reservedStart: null,
+          reservedEnd: null,
+          unresolvedInserts: retained,
+        },
       });
       return;
     }
@@ -485,11 +634,11 @@ async function supersededCancel(
   row: BookingRow,
   op: PendingOp,
 ): Promise<CancelOutcome> {
-  const decision = await reconcileSuperseded(deps.ctx, {
-    kind: 'cancel',
-    op,
-    bookingId: row.id,
-  });
+  const decision = await reconcileSuperseded(
+    deps.ctx,
+    { kind: 'cancel', op, bookingId: row.id },
+    row.hostId,
+  );
   if (decision.response === 'success' && decision.row !== null) {
     return {
       envelope: await buildEnvelope(deps.ctx.store, decision.row, deps.meta, 'lifecycle'),

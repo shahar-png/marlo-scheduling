@@ -1,40 +1,17 @@
-import Google from 'next-auth/providers/google';
+// The full Auth.js configuration, for the Node runtime only.
+//
+// It is `edgeAuthConfig` plus the `signIn` callback, which materializes the
+// owner (C1) and therefore reaches the booking runtime and `node:crypto`.
+// `middleware.ts` must never import this file — see `lib/auth/edge-config.ts`.
+
 import type { NextAuthConfig } from 'next-auth';
-import {
-  ALLOWED_GOOGLE_HOSTED_DOMAIN,
-  isAllowedGoogleWorkspaceIdentity,
-} from './workspace';
-import { isAuthorizedForPath } from './host-guard';
+import { isAllowedGoogleWorkspaceIdentity } from './workspace';
 import { resolveSignIn } from './sign-in';
+import { edgeAuthConfig } from './edge-config';
 import { getRuntime } from '../booking/runtime';
+import { resolveEnv } from '../env';
 
-// C7 / AC-14 — the consent scope set is **exactly** this, in one consent:
-// `calendar.freebusy` is what the retained multi-host read needs,
-// `calendar.events` is what `events.list` / `insert` / `patch` / `delete` need,
-// and `gmail.send` is what P3's real emails need. `access_type=offline` +
-// `prompt=consent` are what produce the refresh token stored (encrypted) in
-// `host_tokens`.
-export const GOOGLE_CONSENT_SCOPES = [
-  'openid',
-  'email',
-  'profile',
-  'https://www.googleapis.com/auth/calendar.freebusy',
-  'https://www.googleapis.com/auth/calendar.events',
-  'https://www.googleapis.com/auth/gmail.send',
-] as const;
-
-export const googleProvider = Google({
-  clientId: process.env.AUTH_GOOGLE_ID,
-  clientSecret: process.env.AUTH_GOOGLE_SECRET,
-  authorization: {
-    params: {
-      hd: ALLOWED_GOOGLE_HOSTED_DOMAIN,
-      access_type: 'offline',
-      prompt: 'consent',
-      scope: GOOGLE_CONSENT_SCOPES.join(' '),
-    },
-  },
-});
+export { GOOGLE_CONSENT_SCOPES, googleProvider } from './edge-config';
 
 function hostedDomainFromProfile(profile: unknown): string | null {
   if (!profile || typeof profile !== 'object') {
@@ -53,16 +30,10 @@ function givenNameFromProfile(profile: unknown): string | null {
 }
 
 export const authConfig = {
-  providers: [googleProvider],
-  pages: {
-    signIn: '/signin',
-  },
-  trustHost: true,
+  ...edgeAuthConfig,
   callbacks: {
-    authorized({ auth, request }) {
-      return isAuthorizedForPath(auth, request.nextUrl.pathname);
-    },
-    async signIn({ profile }) {
+    ...edgeAuthConfig.callbacks,
+    async signIn({ profile, account }) {
       if (
         !isAllowedGoogleWorkspaceIdentity({
           email: profile?.email,
@@ -75,10 +46,19 @@ export const authConfig = {
       // fixture-defined event types and schedule under the stable ids. A
       // reserved local-part fails here with `owner_slug_reserved` before any
       // write (REV5-06).
+      //
+      // AC-14: the same callback persists the offline refresh token, encrypted
+      // under `OAUTH_TOKEN_KEY`. It is the only moment Google ever hands it to
+      // us, so dropping it here is what would leave every live call reporting
+      // `host_not_connected`.
+      const env = resolveEnv();
       const decision = await resolveSignIn({
         owners: getRuntime().owners,
         email: profile?.email ?? null,
         givenName: givenNameFromProfile(profile),
+        refreshToken:
+          typeof account?.refresh_token === 'string' ? account.refresh_token : null,
+        oauthTokenKey: env.oauthTokenKey,
       });
       return decision.ok ? true : decision.redirect;
     },

@@ -1,5 +1,5 @@
 import { notifyBooking } from '@/lib/booking/service';
-import { authorizedScope, resolveBookingId } from '@/lib/api/booking-routes';
+import { authorizedScope, durableRowOf, resolveBookingId } from '@/lib/api/booking-routes';
 import { errorResponse, originOf, readJsonBody } from '@/lib/api/route-helpers';
 
 // C2 / C5 — `POST /api/bookings/{id}/notify`, token-authenticated. Two request
@@ -19,10 +19,7 @@ export async function POST(
 
   const resolved = await resolveBookingId(id);
   try {
-    const scope = await authorizedScope(
-      request,
-      resolved.kind === 'durable' ? resolved.row : null,
-    );
+    const scope = await authorizedScope(request, durableRowOf(resolved));
     const outcome = await notifyBooking(scope, body, originOf(request));
     return Response.json(
       {
