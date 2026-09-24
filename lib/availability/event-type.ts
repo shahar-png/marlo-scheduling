@@ -15,6 +15,8 @@ export type NotificationMode =
 
 export type EventType = {
   id: string;
+  /** C1: every event type belongs to exactly one owner. */
+  ownerId: string;
   hostId: string;
   slug: string;
   name: string;
@@ -27,6 +29,8 @@ export type EventType = {
 };
 
 export type CreateEventTypeInput = {
+  /** Omitted by fixture/test callers, which default to the demo owner (C1). */
+  ownerId?: string;
   hostId: string;
   slug: string;
   name: string;
@@ -36,14 +40,24 @@ export type CreateEventTypeInput = {
   notificationMode?: string;
   maxInvitees?: number;
   hostIds?: string[];
+  /** C1: deterministic id; omitted callers get a fresh uuid as before. */
+  id?: string;
 };
 
+/** C1 — the demo owner every fixture caller belongs to. */
+export const DEMO_OWNER_ID = 'own_demo';
+
 const eventTypes = new Map<string, EventType>();
+/** Keyed `ownerId\u0000slug` — uniqueness is per owner, not global (C1). */
 const slugs = new Map<string, string>();
 
 export function resetEventTypes(): void {
   eventTypes.clear();
   slugs.clear();
+}
+
+function slugKey(ownerId: string, slug: string): string {
+  return `${ownerId}\u0000${slug}`;
 }
 
 export function createEventType(input: CreateEventTypeInput): EventType {
@@ -91,14 +105,20 @@ export function createEventType(input: CreateEventTypeInput): EventType {
     input.kind === COLLECTIVE
       ? normalizeCollectiveHostIds(hostId, input.hostIds)
       : undefined;
-  if (slugs.has(slug)) {
+  const ownerId = (input.ownerId ?? DEMO_OWNER_ID).trim();
+  if (!ownerId) {
+    throw new Error('ownerId is required');
+  }
+  // Uniqueness is `(ownerId, slug)`: two owners may both offer `intro-30`.
+  if (slugs.has(slugKey(ownerId, slug))) {
     throw new Error('slug must be unique');
   }
 
   const notificationMode = resolveNotificationMode(input.notificationMode);
 
   const eventType: EventType = {
-    id: crypto.randomUUID(),
+    id: input.id ?? crypto.randomUUID(),
+    ownerId,
     hostId,
     slug,
     name,
@@ -114,7 +134,7 @@ export function createEventType(input: CreateEventTypeInput): EventType {
     eventType.hostIds = hostIds;
   }
   eventTypes.set(eventType.id, eventType);
-  slugs.set(slug, eventType.id);
+  slugs.set(slugKey(ownerId, slug), eventType.id);
   return cloneEventType(eventType);
 }
 
@@ -123,9 +143,46 @@ export function getEventType(id: string): EventType | null {
   return found ? cloneEventType(found) : null;
 }
 
-export function getEventTypeBySlug(slug: string): EventType | null {
-  const id = slugs.get(slug);
+/**
+ * C1 / AC-2 — the owner-scoped lookup every route uses. A slug is resolved
+ * **within one owner**; two owners may both offer `intro-30`.
+ */
+export function resolveEventType(ownerId: string, slug: string): EventType | null {
+  const trimmed = slug.trim();
+  // Exact first, then the lower-cased form (AC-2: slugs are lower-cased on
+  // lookup; fixtures that registered a mixed-case slug still resolve exactly).
+  const id =
+    slugs.get(slugKey(ownerId, trimmed)) ??
+    slugs.get(slugKey(ownerId, trimmed.toLowerCase()));
   return id ? getEventType(id) : null;
+}
+
+/**
+ * Legacy lookup, resolved **only within the demo owner** (C2). The legacy
+ * `/api/event-types/{slug}/*` routes answer 404 `owner_required` for anything
+ * else; fixture callers that never pass an `ownerId` land here unchanged.
+ */
+export function getEventTypeBySlug(slug: string): EventType | null {
+  return resolveEventType(DEMO_OWNER_ID, slug);
+}
+
+/**
+ * Owners that offer this slug. The legacy `/api/event-types/{slug}/*` routes use
+ * it to tell "no such event" from "that event belongs to another owner", which
+ * is 404 `owner_required` (C2).
+ */
+export function ownersOfSlug(slug: string): string[] {
+  const trimmed = slug.trim();
+  const lowered = trimmed.toLowerCase();
+  return [...eventTypes.values()]
+    .filter((eventType) => eventType.slug === trimmed || eventType.slug === lowered)
+    .map((eventType) => eventType.ownerId);
+}
+
+export function listEventTypesForOwner(ownerId: string): EventType[] {
+  return [...eventTypes.values()]
+    .filter((eventType) => eventType.ownerId === ownerId)
+    .map(cloneEventType);
 }
 
 export function eventTypeHostIds(eventType: Pick<EventType, 'hostId' | 'hostIds'>): string[] {

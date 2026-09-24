@@ -14,7 +14,13 @@ import {
   createAvailabilitySchedule,
   resetAvailabilitySchedules,
 } from '../lib/availability/schedule';
-import { listConfirmedBookingsForHost, resetBookings } from '../lib/booking/booking';
+import { resetBookings } from '../lib/booking/booking';
+import type { MemoryBookingStore } from '../lib/booking/memory-store';
+import {
+  memoryRuntimeHandle,
+  resetRuntime,
+  setRuntimeOverride,
+} from '../lib/booking/runtime';
 import { resetCalendarConnections } from '../lib/calendar/connection';
 import { createFixtureCalendarProvider } from '../lib/calendar/google-freebusy';
 import type { GoogleFreeBusyFixture } from '../lib/calendar/google-freebusy';
@@ -44,18 +50,34 @@ function seedIntro30() {
   });
 }
 
+// C2/C9: a `one_on_one` legacy create runs the shared demo-scoped lifecycle,
+// so it carries an `Idempotency-Key` like every other create entry point. The
+// header is omitted only where a case is asserting its absence.
 function bookingRequest(
   slug: string,
   body: unknown,
+  options: { idempotencyKey?: string | null } = {},
 ): Promise<Response> {
+  const key =
+    options.idempotencyKey === undefined ? crypto.randomUUID() : options.idempotencyKey;
   return POST(
     new Request(`http://localhost/api/event-types/${slug}/bookings`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        ...(key === null ? {} : { 'idempotency-key': key }),
+      },
       body: JSON.stringify(body),
     }),
     { params: Promise.resolve({ slug }) },
   );
+}
+
+/** The shared lifecycle reads the clock, so the fixture slot must be "now". */
+function pinClockTo(iso: string): void {
+  setRuntimeOverride({
+    clock: { now: () => Date.parse(iso), sleep: async () => {} },
+  });
 }
 
 describe('AC-5 POST /api/event-types/:slug/bookings', () => {
@@ -65,12 +87,15 @@ describe('AC-5 POST /api/event-types/:slug/bookings', () => {
     resetBookings();
     resetCalendarConnections();
     setBookingCalendarProvider(null);
+    // The durable memory runtime is a process singleton; a fresh one per case
+    // keeps one test's booking from occupying the next one's slot.
+    resetRuntime();
+    pinClockTo(SLOT_0900);
   });
 
-  it('returns 201 and a confirmed booking payload for a free slot', async () => {
+  it('returns 201 and the C3 envelope for a free slot, with a distinct id and token', async () => {
     seedIntro30();
-    const provider = createFixtureCalendarProvider(FIXTURE);
-    setBookingCalendarProvider(provider);
+    setBookingCalendarProvider(createFixtureCalendarProvider(FIXTURE));
 
     const response = await bookingRequest('intro-30', {
       start: SLOT_0900,
@@ -81,11 +106,14 @@ describe('AC-5 POST /api/event-types/:slug/bookings', () => {
     const body = (await response.json()) as {
       booking: {
         id: string;
+        token: string;
         status: string;
         start: string;
         end: string;
+        revision: number;
         invitee: { name: string; email: string };
       };
+      delivery: { email: string; calendar: string };
     };
     assert.equal(body.booking.status, 'confirmed');
     assert.equal(body.booking.start, SLOT_0900);
@@ -94,19 +122,66 @@ describe('AC-5 POST /api/event-types/:slug/bookings', () => {
       name: 'Ada Lovelace',
       email: 'ada@example.com',
     });
+    // C11: a legacy `one_on_one` create now yields the id/token split, so the
+    // row it produces is not readable without its bearer token.
     assert.ok(body.booking.id);
-    assert.equal(provider.createdEvents.length, 1);
+    assert.ok(body.booking.token);
+    assert.notEqual(body.booking.id, body.booking.token);
+    assert.equal(body.booking.revision, 1);
+    assert.equal(body.delivery.calendar, 'created');
+  });
+
+  it('requires the C9 key for a one_on_one create (C2 / AC-24(f))', async () => {
+    seedIntro30();
+    setBookingCalendarProvider(createFixtureCalendarProvider(FIXTURE));
+
+    const response = await bookingRequest(
+      'intro-30',
+      { start: SLOT_0900, invitee: { name: 'Ada', email: 'ada@example.com' } },
+      { idempotencyKey: null },
+    );
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: 'idempotency_key_required' });
+  });
+
+  it('replays the same key to the same booking rather than a second row', async () => {
+    seedIntro30();
+    setBookingCalendarProvider(createFixtureCalendarProvider(FIXTURE));
+    const key = crypto.randomUUID();
+    const payload = {
+      start: SLOT_0900,
+      invitee: { name: 'Ada', email: 'ada@example.com' },
+    };
+
+    const first = await bookingRequest('intro-30', payload, { idempotencyKey: key });
+    const replay = await bookingRequest('intro-30', payload, { idempotencyKey: key });
+
+    assert.equal(first.status, 201);
+    assert.equal(replay.status, 201);
+    const a = (await first.json()) as { booking: { id: string; token: string } };
+    const b = (await replay.json()) as { booking: { id: string; token: string } };
+    assert.equal(a.booking.id, b.booking.id);
+    assert.equal(a.booking.token, b.booking.token);
   });
 
   it('returns 409 on conflict, 404 for an unknown slug, and 400 for a missing body', async () => {
     seedIntro30();
     setBookingCalendarProvider(createFixtureCalendarProvider(FIXTURE));
 
-    const conflict = await bookingRequest('intro-30', {
-      start: '2026-09-20T14:00:00.000Z',
+    // The shared lifecycle holds the slot from T1, so booking it twice is a
+    // 409 `slot_unavailable` — the C6.1 occupancy rule, not a fixture's
+    // freeBusy window.
+    const first = await bookingRequest('intro-30', {
+      start: SLOT_0900,
       invitee: { name: 'Ada', email: 'ada@example.com' },
     });
+    assert.equal(first.status, 201);
+    const conflict = await bookingRequest('intro-30', {
+      start: SLOT_0900,
+      invitee: { name: 'Grace', email: 'grace@example.com' },
+    });
     assert.equal(conflict.status, 409);
+    assert.deepEqual(await conflict.json(), { error: 'slot_unavailable' });
 
     const missing = await bookingRequest('nope', {
       start: SLOT_0900,
@@ -180,6 +255,16 @@ describe('AC-5 POST /api/event-types/:slug/bookings', () => {
 
     const statuses = [first.status, second.status].sort();
     assert.deepEqual(statuses, [201, 409]);
-    assert.equal(listConfirmedBookingsForHost('host-1').length, 1);
+    // The shared lifecycle serialises on the per-host lock and holds the slot
+    // from T1, so exactly one of the two rows exists (C6.1).
+    assert.equal(await confirmedDurableBookings('host-1'), 1);
   });
 });
+
+/** Rows in the durable store the shared lifecycle writes to. */
+async function confirmedDurableBookings(hostId: string): Promise<number> {
+  const store = memoryRuntimeHandle().store as MemoryBookingStore;
+  return store
+    .allRows()
+    .filter((row) => row.hostId === hostId && row.status === 'confirmed').length;
+}

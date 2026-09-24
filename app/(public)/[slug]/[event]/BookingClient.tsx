@@ -3,7 +3,7 @@
 import { useRouter } from 'next/navigation';
 import { useEffect, useMemo, useState } from 'react';
 import { Logo } from '@/app/components/Logo';
-import { createBooking, getSlots } from '@/lib/api/client';
+import { createBooking, getSlots, recoverBooking } from '@/lib/api/client';
 import type { BookingApi } from '@/lib/api/types';
 import { t } from '@/lib/copy';
 import {
@@ -26,7 +26,14 @@ export type BookingClientProps = {
   hostMeta: BookingHostMeta;
 };
 
-const api: BookingApi = { getSlots, createBooking };
+// C9: `recoverBooking` is the gate-free replay entry point. Without it the form
+// would replay an unresolved submission through `createBooking`, whose
+// elapsed-start gate can discard a key whose booking already committed.
+const api: BookingApi & { recoverBooking: typeof recoverBooking } = {
+  getSlots,
+  createBooking,
+  recoverBooking,
+};
 
 const schedule: Scheduler = {
   setInterval: (callback, ms) => window.setInterval(callback, ms),

@@ -6,11 +6,19 @@ import {
 } from '@/lib/booking/booking';
 import { getBookingCalendarProvider } from '@/lib/booking/calendar-runtime';
 import { getHostCalendarConnection } from '@/lib/calendar/connection';
+import { resolveEnv } from '@/lib/env';
+
+// C10 — fixture-only. In pg/live mode: 501 `links_not_supported` before the
+// link lookup and before any store, calendar, or email side effect.
 
 export async function GET(
   request: Request,
   context: { params: Promise<{ token: string }> },
 ) {
+  if (resolveEnv().store === 'pg') {
+    return Response.json({ error: 'links_not_supported' }, { status: 501 });
+  }
+
   const { token } = await context.params;
   const url = new URL(request.url);
   const timeMin = url.searchParams.get('timeMin');

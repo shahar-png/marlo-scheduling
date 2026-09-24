@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { beforeEach, describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import { createEventType, resetEventTypes } from '../lib/availability/event-type';
 import {
   createOneOffMeeting,
@@ -19,13 +19,14 @@ import {
   LINK_UNUSED,
   resetSingleUseLinks,
 } from '../lib/availability/single-use-link';
+import { bookSingleUseLink, resetBookings } from '../lib/booking/booking';
 import {
-  bookSingleUseLink,
-  BookingConflictError,
-  resetBookings,
-} from '../lib/booking/booking';
+  IdempotencyKeyReusedError,
+  SlotUnavailableError,
+} from '../lib/booking/errors';
 import { createFixtureCalendarProvider } from '../lib/calendar/google-freebusy';
 import type { GoogleFreeBusyFixture } from '../lib/calendar/google-freebusy';
+import { createHarness, teardown, type Harness } from './support/harness';
 
 const FIXTURE = JSON.parse(
   readFileSync(
@@ -34,14 +35,20 @@ const FIXTURE = JSON.parse(
   ),
 ) as GoogleFreeBusyFixture;
 
-const SLOT_0900 = '2026-09-20T09:00:00.000Z';
-const SLOT_1400 = '2026-09-20T14:00:00.000Z';
+// The booking cases run on the harness clock (Monday 2026-09-21T09:00Z), so
+// their fixtures and slots live on that day; the pure link-registry cases above
+// never look at a clock.
+const LINK_DATE = '2026-09-21';
+const LINK_SLOT = '2026-09-21T10:00:00.000Z';
+const LINK_SLOT_END = '2026-09-21T10:30:00.000Z';
+const LINK_SLOT_LATER = '2026-09-21T11:00:00.000Z';
 
 function seedIntro30() {
   const schedule = createAvailabilitySchedule({
     hostId: 'host-1',
     timezone: 'UTC',
-    windows: [{ weekday: 0, start: '09:00', end: '20:00' }],
+    // Monday, the weekday the harness clock sits on.
+    windows: [{ weekday: 1, start: '09:00', end: '20:00' }],
   });
   return createEventType({
     hostId: 'host-1',
@@ -59,7 +66,7 @@ function seedOffsite() {
     name: 'Offsite',
     durationMinutes: 30,
     timezone: 'UTC',
-    windows: [{ date: '2026-09-20', start: '09:00', end: '20:00' }],
+    windows: [{ date: LINK_DATE, start: '09:00', end: '20:00' }],
   });
 }
 
@@ -136,13 +143,24 @@ describe('AC-2 single-use scheduling-link stub', () => {
   });
 });
 
+// C10 — a link booking is a **shared** C6 create now, so these run against the
+// real runtime: the durable store whose occupancy it shares with the
+// owner-scoped route, the mock calendar the lifecycle owns, and a pinned clock
+// (a start that has already elapsed is never on offer). The caller-supplied
+// `provider` no longer reaches the calendar; it survives only on the
+// available-times path.
 describe('AC-4 book through unused single-use link consumes it', () => {
+  let harness: Harness;
+
   beforeEach(() => {
-    resetAvailabilitySchedules();
-    resetEventTypes();
     resetOneOffMeetings();
     resetSingleUseLinks();
     resetBookings();
+    harness = createHarness('memory');
+  });
+
+  afterEach(() => {
+    teardown();
   });
 
   it('confirms a booking on an event-type link and marks the link consumed', async () => {
@@ -151,24 +169,26 @@ describe('AC-4 book through unused single-use link consumes it', () => {
       eventTypeId: eventType.id,
       token: 'use-once',
     });
-    const provider = createFixtureCalendarProvider(FIXTURE);
 
-    const booking = await bookSingleUseLink({
+    const outcome = await bookSingleUseLink({
       token: link.token,
-      start: SLOT_0900,
+      start: LINK_SLOT,
       invitee: { name: 'Ada Lovelace', email: 'ada@example.com' },
-      provider,
+      provider: createFixtureCalendarProvider(FIXTURE),
       calendarId: 'primary',
     });
 
-    assert.equal(booking.status, 'confirmed');
-    assert.equal(booking.start, SLOT_0900);
-    assert.equal(booking.end, '2026-09-20T09:30:00.000Z');
-    assert.equal(provider.createdEvents.length, 1);
+    assert.equal(outcome.envelope.booking.status, 'confirmed');
+    assert.equal(outcome.envelope.booking.start, LINK_SLOT);
+    assert.equal(outcome.envelope.booking.end, LINK_SLOT_END);
+    // Exactly one calendar event, created by the lifecycle (C6.4), not by the
+    // link path calling the provider itself.
+    assert.equal(harness.calendar.liveEvents().length, 1);
 
     const consumed = getSingleUseLinkByToken('use-once');
     assert.equal(consumed?.status, LINK_CONSUMED);
-    assert.equal(consumed?.bookingId, booking.id);
+    assert.equal(consumed?.consumedByBookingId, outcome.row.id);
+    assert.equal(consumed?.bookingId, outcome.row.id);
   });
 
   it('confirms a booking on a one-off link and consumes the token', async () => {
@@ -178,40 +198,99 @@ describe('AC-4 book through unused single-use link consumes it', () => {
       token: 'off-once',
     });
 
-    const booking = await bookSingleUseLink({
+    const outcome = await bookSingleUseLink({
       token: link.token,
-      start: SLOT_0900,
+      start: LINK_SLOT,
       invitee: { name: 'Grace', email: 'grace@example.com' },
       provider: createFixtureCalendarProvider(FIXTURE),
       calendarId: 'primary',
     });
 
-    assert.equal(booking.status, 'confirmed');
-    assert.equal(booking.start, SLOT_0900);
+    assert.equal(outcome.envelope.booking.status, 'confirmed');
+    assert.equal(outcome.envelope.booking.start, LINK_SLOT);
     const consumed = getSingleUseLinkByToken('off-once');
     assert.equal(consumed?.status, LINK_CONSUMED);
-    assert.equal(consumed?.bookingId, booking.id);
+    assert.equal(consumed?.consumedByBookingId, outcome.row.id);
   });
 
-  it('does not consume the link on a 409 slot conflict', async () => {
+  it('does not consume the link on a slot conflict held by another booking', async () => {
+    // The point of the shared path: occupancy written by *any* route for this
+    // host blocks the link, and a refused link stays spendable.
     const meeting = seedOffsite();
-    createSingleUseLink({
-      oneOffMeetingId: meeting.id,
-      token: 'still-open',
+    createSingleUseLink({ oneOffMeetingId: meeting.id, token: 'taken-first' });
+    createSingleUseLink({ oneOffMeetingId: meeting.id, token: 'still-open' });
+
+    await bookSingleUseLink({
+      token: 'taken-first',
+      start: LINK_SLOT,
+      invitee: { name: 'Grace', email: 'grace@example.com' },
+      provider: createFixtureCalendarProvider(FIXTURE),
+      calendarId: 'primary',
     });
 
     await assert.rejects(
       () =>
         bookSingleUseLink({
           token: 'still-open',
-          start: SLOT_1400,
+          start: LINK_SLOT,
           invitee: { name: 'Ada', email: 'ada@example.com' },
           provider: createFixtureCalendarProvider(FIXTURE),
           calendarId: 'primary',
         }),
-      BookingConflictError,
+      SlotUnavailableError,
     );
 
     assert.equal(getSingleUseLinkByToken('still-open')?.status, LINK_UNUSED);
+  });
+
+  it('replays the original booking when a consumed link is re-POSTed with the identical payload', async () => {
+    const meeting = seedOffsite();
+    createSingleUseLink({ oneOffMeetingId: meeting.id, token: 'lost-201' });
+    const payload = {
+      token: 'lost-201',
+      start: LINK_SLOT,
+      invitee: { name: 'Ada Lovelace', email: 'ada@example.com' },
+      provider: createFixtureCalendarProvider(FIXTURE),
+      calendarId: 'primary',
+    };
+
+    const first = await bookSingleUseLink(payload);
+    // The client never saw the 201 and retries the same request.
+    const replay = await bookSingleUseLink(payload);
+
+    assert.equal(replay.replayed, true);
+    assert.equal(replay.row.id, first.row.id);
+    assert.equal(replay.envelope.booking.token, first.envelope.booking.token);
+    // One booking, one calendar event — the retry inserted nothing.
+    assert.equal(harness.calendar.liveEvents().length, 1);
+    assert.equal(
+      getSingleUseLinkByToken('lost-201')?.consumedByBookingId,
+      first.row.id,
+    );
+  });
+
+  it('refuses a consumed link whose payload differs', async () => {
+    const meeting = seedOffsite();
+    createSingleUseLink({ oneOffMeetingId: meeting.id, token: 'spent' });
+
+    await bookSingleUseLink({
+      token: 'spent',
+      start: LINK_SLOT,
+      invitee: { name: 'Ada Lovelace', email: 'ada@example.com' },
+      provider: createFixtureCalendarProvider(FIXTURE),
+      calendarId: 'primary',
+    });
+
+    await assert.rejects(
+      () =>
+        bookSingleUseLink({
+          token: 'spent',
+          start: LINK_SLOT_LATER,
+          invitee: { name: 'Grace', email: 'grace@example.com' },
+          provider: createFixtureCalendarProvider(FIXTURE),
+          calendarId: 'primary',
+        }),
+      IdempotencyKeyReusedError,
+    );
   });
 });

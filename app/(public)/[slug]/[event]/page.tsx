@@ -1,9 +1,9 @@
-import { redirect } from 'next/navigation';
 import { Logo } from '@/app/components/Logo';
 import { publicBookingPath } from '@/lib/api/public-path';
-import { getEventTypeBySlug } from '@/lib/availability/event-type';
+import { LifecycleError } from '@/lib/booking/errors';
+import { ensureOwnerFixtures } from '@/lib/booking/fixtures';
+import { resolveScope } from '@/lib/booking/service';
 import { t } from '@/lib/copy';
-import { ensureDemoFixtures, hostMetaForHostId } from '@/lib/demo/seed';
 import { BookingClient } from './BookingClient';
 
 // Public booking page — Server Component. Serializable work only: seed the
@@ -13,14 +13,15 @@ import { BookingClient } from './BookingClient';
 // server does not know the invitee's time zone, so it does not pick the
 // displayed month either (BOOK-FE-09) — the client derives it after mount.
 //
-// Host chrome (BOOK-FE-15): `[slug]` is never a source of chrome. The host is
-// resolved from the event type's `hostId` through `hostMetaForHostId`; an
-// alias that differs from the canonical host slug is canonicalized with
-// `redirect()`, and the props passed down are the canonical host's either way.
+// Owner-scoped resolution (P1 / C1): `[slug]` **is** the owner slug and the
+// page resolves `(ownerSlug, eventSlug)` through the selected catalog — the
+// fixture registry in memory mode, Postgres in pg mode. Two owners may both
+// offer `intro-30` and each gets their own page, their own availability, and
+// their own chrome. `/demo/intro-30` is just the fixture owner's page.
 //
 // Safe paths (BOOK-FE-19): the canonical path comes from the shared
 // constructor. A store-backed event type whose slug is unrepresentable has no
-// public booking page — the not-found shell, no redirect, no BookingClient.
+// public booking page — the not-found shell, no BookingClient.
 
 export const dynamic = 'force-dynamic';
 
@@ -47,39 +48,42 @@ export default async function BookingPage({
   params: Promise<{ slug: string; event: string }>;
 }) {
   const { slug, event } = await params;
-  ensureDemoFixtures();
-  const eventType = getEventTypeBySlug(event);
 
-  if (!eventType) {
-    return <NotFoundShell />;
+  let scope: Awaited<ReturnType<typeof resolveScope>>;
+  try {
+    // `[slug]` **is** the owner slug (P1/C1). Fixture owners exist only in
+    // memory mode; in pg mode owners come from sign-in materialization, so an
+    // unknown slug stays a 404 here rather than falling back to the demo
+    // catalog. Seeding resolves the runtime, so it belongs inside the same
+    // boundary as the catalog resolution it precedes (REV-07).
+    await ensureOwnerFixtures(slug);
+    scope = await resolveScope(slug, event);
+  } catch (error) {
+    // A reserved or unknown owner, an unknown event under a known owner, and a
+    // kind the live path refuses all render the branded not-found shell.
+    if (error instanceof LifecycleError) {
+      return <NotFoundShell />;
+    }
+    throw error;
   }
 
-  const host = hostMetaForHostId(eventType.hostId);
-  if (!host) {
-    // A public page for a non-demo host is a non-goal; never invent a name.
+  // A slug the path constructor rejects has no public booking page.
+  if (publicBookingPath(scope.owner.slug, scope.eventType.slug) === null) {
     return <NotFoundShell />;
-  }
-
-  const canonicalPath = publicBookingPath(host.slug, eventType.slug);
-  if (canonicalPath === null) {
-    return <NotFoundShell />;
-  }
-
-  if (slug !== host.slug) {
-    // Temporary redirect; `redirect()` throws, so nothing after it renders.
-    redirect(canonicalPath);
   }
 
   return (
     <BookingClient
-      slug={eventType.slug}
-      hostSlug={host.slug}
+      slug={scope.eventType.slug}
+      // Host chrome is THIS owner's, resolved from the catalog — never a demo
+      // fallback and never derived from anything but the resolved owner.
+      hostSlug={scope.owner.slug}
       eventMeta={{
-        name: eventType.name,
-        durationMinutes: eventType.durationMinutes,
-        kind: eventType.kind,
+        name: scope.eventType.name,
+        durationMinutes: scope.eventType.durationMinutes,
+        kind: scope.eventType.kind,
       }}
-      hostMeta={{ firstName: host.firstName }}
+      hostMeta={{ firstName: scope.owner.firstName }}
     />
   );
 }

@@ -19,6 +19,8 @@ import {
   listConfirmedBookingsForHost,
   resetBookings,
 } from '../lib/booking/booking';
+import { resetRuntime, setRuntimeOverride } from '../lib/booking/runtime';
+import { createMockCalendar, type MockCalendar } from '../lib/google/mock-calendar';
 import { resetCalendarConnections } from '../lib/calendar/connection';
 import { createFixtureCalendarProvider } from '../lib/calendar/google-freebusy';
 import type { GoogleFreeBusyFixture } from '../lib/calendar/google-freebusy';
@@ -84,6 +86,8 @@ function stubTransport(
 }
 
 describe('AC-3 lib/api adapters map to the existing handlers', () => {
+  let mockCalendar: MockCalendar;
+
   beforeEach(() => {
     resetAvailabilitySchedules();
     resetEventTypes();
@@ -91,6 +95,23 @@ describe('AC-3 lib/api adapters map to the existing handlers', () => {
     resetCalendarConnections();
     setBookingCalendarProvider(null);
     setAvailableTimesCalendarProvider(null);
+    // A `one_on_one` create now runs the shared C6 lifecycle, which reads the
+    // **runtime** clock and holds slots durably: pin the clock to the fixture
+    // slot and start each case from a fresh store (C2/C9).
+    resetRuntime();
+    // Legacy `one_on_one` availability now reads the shared C6.1 occupancy and
+    // the shared C7 `events.list` classification, so the external busy the old
+    // fixture `freeBusy` supplied is seeded on the runtime's calendar instead.
+    mockCalendar = createMockCalendar();
+    mockCalendar.seedExternal({
+      id: 'external-lunch',
+      start: '2026-09-20T14:00:00.000Z',
+      end: '2026-09-20T15:00:00.000Z',
+    });
+    setRuntimeOverride({
+      calendar: mockCalendar,
+      clock: { now: () => Date.parse(SLOT_0900), sleep: async () => {} },
+    });
   });
 
   it('getSlots reads GET /api/event-types/:slug/available-times and normalises { times }', async () => {
@@ -108,7 +129,7 @@ describe('AC-3 lib/api adapters map to the existing handlers', () => {
     assert.equal(transport.calls.length, 1);
     assert.match(transport.calls[0].path, /^\/api\/event-types\/intro-30\/available-times\?/);
     assert.ok(result.times.some((slot) => slot.start === SLOT_0900));
-    // Fixture busy 14:00–15:00 is excluded by the existing slot engine.
+    // External busy 14:00–15:00, classified by C7 from the shared calendar.
     assert.equal(result.times.some((slot) => slot.start === '2026-09-20T14:00:00.000Z'), false);
     assert.equal(result.times[0].spotsRemaining, undefined);
   });
@@ -130,10 +151,9 @@ describe('AC-3 lib/api adapters map to the existing handlers', () => {
     assert.equal(slot.spotsRemaining, 3);
   });
 
-  it('createBooking POSTs { start, invitee } and maps 201 booking.id to token', async () => {
+  it('createBooking POSTs { start, invitee } with the C9 key and maps the C3 envelope', async () => {
     seedIntro30();
-    const provider = createFixtureCalendarProvider(FIXTURE);
-    setBookingCalendarProvider(provider);
+    setBookingCalendarProvider(createFixtureCalendarProvider(FIXTURE));
     const transport = createHandlerTransport();
     const api = createApiClient({ transport, now: fixedClock('2026-09-01T00:00:00.000Z') });
 
@@ -141,6 +161,7 @@ describe('AC-3 lib/api adapters map to the existing handlers', () => {
       slug: 'intro-30',
       start: SLOT_0900,
       invitee: { name: 'Ada Lovelace', email: 'ada@example.com' },
+      idempotencyKey: crypto.randomUUID(),
     });
 
     assert.equal(transport.calls.length, 1);
@@ -150,15 +171,35 @@ describe('AC-3 lib/api adapters map to the existing handlers', () => {
       start: SLOT_0900,
       invitee: { name: 'Ada Lovelace', email: 'ada@example.com' },
     });
+    assert.ok(transport.calls[0].headers?.['idempotency-key']);
     assert.equal(result.ok, true);
     if (!result.ok) return;
-    const bookings = listConfirmedBookingsForHost('host-1');
-    assert.equal(bookings.length, 1);
-    assert.equal(result.booking.token, bookings[0].id);
+    // C11: the token is mapped from `booking.token` and is never the id.
+    assert.ok(result.booking.id);
+    assert.ok(result.booking.token);
+    assert.notEqual(result.booking.id, result.booking.token);
     assert.equal(result.booking.start, SLOT_0900);
     assert.equal(result.booking.end, '2026-09-20T09:30:00.000Z');
     assert.equal(result.booking.status, 'confirmed');
-    assert.equal(provider.createdEvents.length, 1);
+  });
+
+  it('createBooking without the C9 key is a typed failure, not a booking', async () => {
+    seedIntro30();
+    setBookingCalendarProvider(createFixtureCalendarProvider(FIXTURE));
+    const api = createApiClient({
+      transport: createHandlerTransport(),
+      now: fixedClock('2026-09-01T00:00:00.000Z'),
+    });
+    const result = await api.createBooking({
+      slug: 'intro-30',
+      start: SLOT_0900,
+      invitee: { name: 'Ada', email: 'ada@example.com' },
+    });
+    assert.equal(result.ok, false);
+    if (result.ok) return;
+    assert.equal(result.code, UNKNOWN_ERROR);
+    assert.equal(result.status, 400);
+    assert.equal(result.error, 'idempotency_key_required');
   });
 
   it('createBooking maps 409 slot_unavailable to its typed code', async () => {
@@ -168,10 +209,19 @@ describe('AC-3 lib/api adapters map to the existing handlers', () => {
       transport: createHandlerTransport(),
       now: fixedClock('2026-09-01T00:00:00.000Z'),
     });
+    const taken = await api.createBooking({
+      slug: 'intro-30',
+      start: SLOT_0900,
+      invitee: { name: 'First', email: 'first@example.com' },
+      idempotencyKey: crypto.randomUUID(),
+    });
+    assert.equal(taken.ok, true);
+    // The slot is held from T1, so a second create for it is 409 (C6.1).
     const result = await api.createBooking({
       slug: 'intro-30',
-      start: '2026-09-20T14:00:00.000Z', // fixture busy
+      start: SLOT_0900,
       invitee: { name: 'Ada', email: 'ada@example.com' },
+      idempotencyKey: crypto.randomUUID(),
     });
     assert.deepEqual(result, { ok: false, code: SLOT_UNAVAILABLE });
   });
@@ -228,11 +278,18 @@ describe('AC-3 lib/api adapters map to the existing handlers', () => {
       slug: 'intro-30',
       start: SLOT_0900,
       invitee: { name: 'Ada', email: 'ada@example.com' },
+      idempotencyKey: crypto.randomUUID(),
     });
     assert.equal(created.ok, true);
     if (!created.ok) return;
-    const found = await api.getBooking(created.booking.token);
-    assert.equal(found?.token, created.booking.token);
+    // C11: `GET /api/bookings/{id}` takes the **id** and needs the bearer
+    // token, so the token-only legacy read finds nothing for a durable row.
+    assert.equal(await api.getBooking(created.booking.token), null);
+    const authed = await api.getBookingById({
+      id: created.booking.id,
+      token: created.booking.token,
+    });
+    assert.equal(authed?.token, created.booking.token);
     assert.equal(await api.getBooking('missing-token'), null);
   });
 });

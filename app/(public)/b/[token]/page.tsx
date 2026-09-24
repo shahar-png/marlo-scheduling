@@ -1,5 +1,6 @@
 import { Logo } from '@/app/components/Logo';
-import { getBookingByToken } from '@/lib/api/server';
+import { getBookingByToken, getDurableBookingByToken } from '@/lib/api/server';
+import { BookingControls } from './BookingControls';
 import type { ConfirmedPublicBooking } from '@/lib/api/types';
 import { BOOKING_CANCELLED, BOOKING_CONFIRMED } from '@/lib/booking/booking';
 import { t } from '@/lib/copy';
@@ -139,7 +140,10 @@ export default async function ConfirmationPage({
   params: Promise<{ token: string }>;
 }) {
   const { token } = await params;
-  const result = getBookingByToken(token);
+  // C11: the durable row is looked up by the `token` column first; the retained
+  // fixture adapter serves only rows the durable store does not hold.
+  const durable = await getDurableBookingByToken(token);
+  const result = durable ?? getBookingByToken(token);
 
   if (result?.kind === 'unsupported_host') {
     return (
@@ -157,7 +161,19 @@ export default async function ConfirmationPage({
       data-confirmation-token={token}
       data-booking-status={booking?.status || undefined}
     >
-      {booking?.status === BOOKING_CONFIRMED ? (
+      {/* C12: a durable row renders its details AND its controls from one
+          current booking state, so a reschedule moves the displayed time and a
+          cancel swaps the panel. A retained fixture booking has no revision, no
+          bearer token, and no C6 lifecycle, so it keeps the static panels. */}
+      {durable !== null ? (
+        <BookingControls
+          booking={durable}
+          hostFirstName={durable.hostFirstName}
+          {...(durable.bookAgainHref === undefined
+            ? {}
+            : { bookAgainHref: durable.bookAgainHref })}
+        />
+      ) : booking?.status === BOOKING_CONFIRMED ? (
         <ConfirmedPanel booking={booking} />
       ) : booking?.status === BOOKING_CANCELLED ? (
         <CancelledPanel booking={booking} />

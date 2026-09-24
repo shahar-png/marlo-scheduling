@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { beforeEach, describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import { GET as healthGET } from '../app/api/health/route';
 import { GET as linkTimesGET } from '../app/api/links/[token]/available-times/route';
 import {
@@ -29,6 +29,7 @@ import { resetBookings } from '../lib/booking/booking';
 import { resetCalendarConnections } from '../lib/calendar/connection';
 import { createFixtureCalendarProvider } from '../lib/calendar/google-freebusy';
 import type { GoogleFreeBusyFixture } from '../lib/calendar/google-freebusy';
+import { createHarness, teardown } from './support/harness';
 
 const FIXTURE = JSON.parse(
   readFileSync(
@@ -37,7 +38,10 @@ const FIXTURE = JSON.parse(
   ),
 ) as GoogleFreeBusyFixture;
 
-const SLOT_0900 = '2026-09-20T09:00:00.000Z';
+// Monday, the day the harness clock sits on: a link create is a shared C6
+// create now, and a start that has already elapsed is not on offer (C9).
+const SLOT_1000 = '2026-09-21T10:00:00.000Z';
+const SLOT_1030 = '2026-09-21T10:30:00.000Z';
 
 function seedOffsiteLink(token = 'guest-once') {
   const meeting = createOneOffMeeting({
@@ -45,7 +49,7 @@ function seedOffsiteLink(token = 'guest-once') {
     name: 'Offsite',
     durationMinutes: 30,
     timezone: 'UTC',
-    windows: [{ date: '2026-09-20', start: '09:00', end: '20:00' }],
+    windows: [{ date: '2026-09-21', start: '09:00', end: '20:00' }],
   });
   return createSingleUseLink({
     oneOffMeetingId: meeting.id,
@@ -57,7 +61,7 @@ function seedEventTypeLink(token = 'weekly-once') {
   const schedule = createAvailabilitySchedule({
     hostId: 'host-1',
     timezone: 'UTC',
-    windows: [{ weekday: 0, start: '09:00', end: '20:00' }],
+    windows: [{ weekday: 1, start: '09:00', end: '20:00' }],
   });
   const eventType = createEventType({
     hostId: 'host-1',
@@ -87,7 +91,7 @@ function bookRequest(token: string, body: unknown): Promise<Response> {
 function timesRequest(token: string): Promise<Response> {
   return linkTimesGET(
     new Request(
-      `http://localhost/api/links/${token}/available-times?timeMin=2026-09-20T00:00:00.000Z&timeMax=2026-09-21T00:00:00.000Z`,
+      `http://localhost/api/links/${token}/available-times?timeMin=2026-09-21T00:00:00.000Z&timeMax=2026-09-22T00:00:00.000Z`,
     ),
     { params: Promise.resolve({ token }) },
   );
@@ -95,13 +99,19 @@ function timesRequest(token: string): Promise<Response> {
 
 describe('AC-5 POST /api/links/:token/bookings consume + 410 reuse', () => {
   beforeEach(() => {
-    resetAvailabilitySchedules();
-    resetEventTypes();
     resetOneOffMeetings();
     resetSingleUseLinks();
     resetBookings();
     resetCalendarConnections();
     setBookingCalendarProvider(null);
+    // C10 — the POST is the shared C6 create, so it needs the real runtime and
+    // a pinned clock. `createHarness` resets the event-type and schedule
+    // registries itself, so every fixture below is seeded after it.
+    createHarness('memory');
+  });
+
+  afterEach(() => {
+    teardown();
   });
 
   it('returns 201 then 410 on reuse, and GET times is 410 after consume', async () => {
@@ -111,10 +121,10 @@ describe('AC-5 POST /api/links/:token/bookings consume + 410 reuse', () => {
     const openTimes = await timesRequest('once');
     assert.equal(openTimes.status, 200);
     const openBody = (await openTimes.json()) as { times: string[] };
-    assert.ok(openBody.times.includes(SLOT_0900));
+    assert.ok(openBody.times.includes(SLOT_1000));
 
     const created = await bookRequest('once', {
-      start: SLOT_0900,
+      start: SLOT_1000,
       invitee: { name: 'Ada Lovelace', email: 'ada@example.com' },
     });
     assert.equal(created.status, 201);
@@ -122,11 +132,21 @@ describe('AC-5 POST /api/links/:token/bookings consume + 410 reuse', () => {
       booking: { id: string; status: string; start: string };
     };
     assert.equal(createdBody.booking.status, 'confirmed');
-    assert.equal(createdBody.booking.start, SLOT_0900);
+    assert.equal(createdBody.booking.start, SLOT_1000);
     assert.equal(getSingleUseLinkByToken('once')?.status, LINK_CONSUMED);
 
+    // An identical retry after a lost 201 replays the original booking, so the
+    // 410 must come from a payload that genuinely differs (C10 / REV3-09).
+    const replay = await bookRequest('once', {
+      start: SLOT_1000,
+      invitee: { name: 'Ada Lovelace', email: 'ada@example.com' },
+    });
+    assert.equal(replay.status, 201);
+    const replayBody = (await replay.json()) as { booking: { id: string } };
+    assert.equal(replayBody.booking.id, createdBody.booking.id);
+
     const reuse = await bookRequest('once', {
-      start: '2026-09-20T09:30:00.000Z',
+      start: SLOT_1030,
       invitee: { name: 'Grace', email: 'grace@example.com' },
     });
     assert.equal(reuse.status, 410);
@@ -140,7 +160,7 @@ describe('AC-5 POST /api/links/:token/bookings consume + 410 reuse', () => {
     setBookingCalendarProvider(createFixtureCalendarProvider(FIXTURE));
 
     const missing = await bookRequest('nope', {
-      start: SLOT_0900,
+      start: SLOT_1000,
       invitee: { name: 'Ada', email: 'ada@example.com' },
     });
     assert.equal(missing.status, 404);

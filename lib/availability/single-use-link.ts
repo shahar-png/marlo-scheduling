@@ -14,6 +14,16 @@ export type SingleUseLink = {
   eventTypeId?: string;
   oneOffMeetingId?: string;
   bookingId?: string;
+  /**
+   * C10 — the booking that consumed this link. Consumption is **idempotent for
+   * the same booking**: T2 of the shared create may run twice (a resumed create,
+   * a replayed one), and re-consuming for the id already recorded is a no-op
+   * rather than the error that would strand a committed booking.
+   *
+   * Always equal to {@link SingleUseLink.bookingId}; the explicit name is the
+   * one C10 uses, and the older field is kept for the fixture callers.
+   */
+  consumedByBookingId?: string;
 };
 
 export type CreateSingleUseLinkInput = {
@@ -99,12 +109,17 @@ export function consumeSingleUseLink(
   if (!link) {
     throw new Error('single-use link not found');
   }
-  if (link.status === LINK_CONSUMED) {
-    throw new Error('single-use link already consumed');
-  }
   const trimmedBookingId = bookingId.trim();
   if (!trimmedBookingId) {
     throw new Error('bookingId is required');
+  }
+  if (link.status === LINK_CONSUMED) {
+    // Idempotent for the booking that already owns the link (C10). Only a
+    // *different* booking is a genuine double-consume.
+    if (link.bookingId !== trimmedBookingId) {
+      throw new Error('single-use link already consumed');
+    }
+    return cloneLink(link);
   }
   link.status = LINK_CONSUMED;
   link.bookingId = trimmedBookingId;
@@ -126,6 +141,7 @@ function cloneLink(link: SingleUseLink): SingleUseLink {
   }
   if (link.bookingId !== undefined) {
     cloned.bookingId = link.bookingId;
+    cloned.consumedByBookingId = link.bookingId;
   }
   return cloned;
 }
